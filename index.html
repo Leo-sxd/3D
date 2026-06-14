@@ -23,11 +23,15 @@
         <input type="file" id="fileInput" accept=".stl">
         <div class="file-info" id="fileInfo"></div>
         <button class="btn-clear" id="btnClear" style="display:none;">清除模型</button>
+        <button class="btn-views" id="btnViews">三视图</button>
     </div>
     
     <video id="video" autoplay playsinline></video>
     <div id="gestureStatus">手势识别: 初始化中...</div>
     <canvas id="glCanvas"></canvas>
+    <div id="viewFrontBg" class="view-bg"></div>
+    <div id="viewTopBg" class="view-bg"></div>
+    <div id="viewLeftBg" class="view-bg"></div>
 
     <!-- MediaPipe Hands -->
     <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" onerror="console.warn('MediaPipe Hands 加载失败')"></script>

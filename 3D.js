@@ -34,10 +34,22 @@ const Mat4 = {
             for(let k=0;k<4;k++) out[i*4+j]+=a[k*4+j]*b[i*4+k];
         }
         return out;
+    },
+    ortho(out, left, right, bottom, top, near, far) {
+        const lr = 1 / (left - right);
+        const bt = 1 / (bottom - top);
+        const nf = 1 / (near - far);
+        out[0] = -2 * lr; out[1] = 0; out[2] = 0; out[3] = 0;
+        out[4] = 0; out[5] = -2 * bt; out[6] = 0; out[7] = 0;
+        out[8] = 0; out[9] = 0; out[10] = 2 * nf; out[11] = 0;
+        out[12] = (left + right) * lr;
+        out[13] = (top + bottom) * bt;
+        out[14] = (far + near) * nf;
+        out[15] = 1;
+        return out;
     }
 };
 
-//2. WebGL 初始化与着色器编译
 const canvas = document.getElementById('glCanvas');
 const gl = canvas.getContext('webgl', { antialias: true, alpha: false });
 if (!gl) { alert('您的浏览器不支持 WebGL'); throw new Error('No WebGL'); }
@@ -307,6 +319,402 @@ function resize() {
 window.addEventListener('resize', resize);
 resize();
 
+//==================== 9. 三视图功能 ====================
+let showThreeViews = false;
+const btnViews = document.getElementById('btnViews');
+const viewFrontBg = document.getElementById('viewFrontBg');
+const viewTopBg = document.getElementById('viewTopBg');
+const viewLeftBg = document.getElementById('viewLeftBg');
+
+btnViews.addEventListener('click', () => {
+    showThreeViews = !showThreeViews;
+    btnViews.classList.toggle('active', showThreeViews);
+    viewFrontBg.classList.toggle('show', showThreeViews);
+    viewTopBg.classList.toggle('show', showThreeViews);
+    viewLeftBg.classList.toggle('show', showThreeViews);
+});
+
+// 边线着色器
+const VS_EDGE = `
+attribute vec3 aPos;
+uniform mat4 uMVP;
+void main(){
+    gl_Position = uMVP * vec4(aPos, 1.0);
+}`;
+const FS_EDGE = `
+precision mediump float;
+uniform vec4 uColor;
+void main(){
+    gl_FragColor = uColor;
+}`;
+
+const edgeProgram = createProgram(gl, VS_EDGE, FS_EDGE);
+const edgeU_MVP = gl.getUniformLocation(edgeProgram, 'uMVP');
+const edgeU_Color = gl.getUniformLocation(edgeProgram, 'uColor');
+const edgeAPos = gl.getAttribLocation(edgeProgram, 'aPos');
+
+// 从三角网格提取边线并分类（可见/隐藏）- Z-buffer方案
+function extractEdges(vertices, normals, scale, offsetX, offsetY, offsetZ) {
+    const DIHEDRAL_THRESHOLD = 0.92; // cos(23°)
+    const GRID = 300; // 深度缓冲区分辨率
+    const SAMPLES = 40; // 每条边采样点数
+    
+    // 收集所有三角面
+    const triangles = [];
+    let minX=Infinity,minY=Infinity,minZ=Infinity,maxX=-Infinity,maxY=-Infinity,maxZ=-Infinity;
+    
+    for (let i = 0; i < vertices.length; i += 9) {
+        const x0 = vertices[i]*scale+offsetX, y0 = vertices[i+1]*scale+offsetY, z0 = vertices[i+2]*scale+offsetZ;
+        const x1 = vertices[i+3]*scale+offsetX, y1 = vertices[i+4]*scale+offsetY, z1 = vertices[i+5]*scale+offsetZ;
+        const x2 = vertices[i+6]*scale+offsetX, y2 = vertices[i+7]*scale+offsetY, z2 = vertices[i+8]*scale+offsetZ;
+        
+        minX=Math.min(minX,x0,x1,x2); maxX=Math.max(maxX,x0,x1,x2);
+        minY=Math.min(minY,y0,y1,y2); maxY=Math.max(maxY,y0,y1,y2);
+        minZ=Math.min(minZ,z0,z1,z2); maxZ=Math.max(maxZ,z0,z1,z2);
+        
+        // 几何叉积法向量
+        const e1x=x1-x0, e1y=y1-y0, e1z=z1-z0;
+        const e2x=x2-x0, e2y=y2-y0, e2z=z2-z0;
+        let fnx=e1y*e2z-e1z*e2y, fny=e1z*e2x-e1x*e2z, fnz=e1x*e2y-e1y*e2x;
+        const fnLen=Math.hypot(fnx,fny,fnz);
+        if(fnLen>0){fnx/=fnLen;fny/=fnLen;fnz/=fnLen;}
+        
+        triangles.push({
+            v0:[x0,y0,z0], v1:[x1,y1,z1], v2:[x2,y2,z2],
+            n:[fnx,fny,fnz]
+        });
+    }
+    
+    // 收集所有边
+    const edgeMap = new Map();
+    for(const tri of triangles){
+        const edges=[[tri.v0,tri.v1],[tri.v1,tri.v2],[tri.v2,tri.v0]];
+        for(const[a,b]of edges){
+            const key=edgeKey(a,b);
+            if(!edgeMap.has(key)) edgeMap.set(key,{a,b,normals:[]});
+            edgeMap.get(key).normals.push(tri.n);
+        }
+    }
+    
+    // 包围盒中心
+    const cx=(minX+maxX)/2, cy=(minY+maxY)/2, cz=(minZ+maxZ)/2;
+    const modelSize = Math.max(maxX-minX, maxY-minY, maxZ-minZ);
+    const depthTolerance = modelSize * 0.003; // 相对容差
+    
+    // 修正法向量方向：确保指向远离包围盒中心
+    for(const[key,edge]of edgeMap){
+        const midX=(edge.a[0]+edge.b[0])/2, midY=(edge.a[1]+edge.b[1])/2, midZ=(edge.a[2]+edge.b[2])/2;
+        const toSurfaceX=midX-cx, toSurfaceY=midY-cy, toSurfaceZ=midZ-cz;
+        for(const n of edge.normals){
+            if(n[0]*toSurfaceX+n[1]*toSurfaceY+n[2]*toSurfaceZ<0){
+                n[0]=-n[0];n[1]=-n[1];n[2]=-n[2];
+            }
+        }
+    }
+    
+    // 为每个视图构建深度缓冲区
+    const viewDirs=[[0,-1,0],[0,0,-1],[-1,0,0]];
+    const depthBuffers = [];
+    
+    for(const vd of viewDirs){
+        const depthBuf = new Float64Array(GRID * GRID);
+        for(let i=0;i<GRID*GRID;i++) depthBuf[i]=Infinity;
+        
+        // 光栅化所有三角形到深度缓冲区
+        for(const tri of triangles){
+            rasterizeTriangle(tri, vd, depthBuf, GRID, minX,maxX,minY,maxY,minZ,maxZ);
+        }
+        depthBuffers.push(depthBuf);
+    }
+    
+    const result={frontAll:[],frontVisible:[],frontHidden:[],topAll:[],topVisible:[],topHidden:[],leftAll:[],leftVisible:[],leftHidden:[]};
+    const viewResults=[
+        {vis:result.frontVisible,hid:result.frontHidden,all:result.frontAll},
+        {vis:result.topVisible,hid:result.topHidden,all:result.topAll},
+        {vis:result.leftVisible,hid:result.leftHidden,all:result.leftAll}
+    ];
+    
+    // 对每条边进行分类
+    for(const[key,edge]of edgeMap){
+        const{a,b,normals:faceNormals}=edge;
+        
+        // 二面角过滤：只保留相邻面法向量夹角 > 23° 的特征边
+        let isFeature=false;
+        if(faceNormals.length===1) isFeature=true;
+        else{
+            for(let i=0;i<faceNormals.length&&!isFeature;i++){
+                for(let j=i+1;j<faceNormals.length&&!isFeature;j++){
+                    const d=Math.abs(faceNormals[i][0]*faceNormals[j][0]+faceNormals[i][1]*faceNormals[j][1]+faceNormals[i][2]*faceNormals[j][2]);
+                    if(d<DIHEDRAL_THRESHOLD) isFeature=true;
+                }
+            }
+        }
+        
+        // 每视图独立判断
+        for(let vi=0;vi<3;vi++){
+            const vd=viewDirs[vi];
+            
+            // 计算每个面的dot值
+            const dots = faceNormals.map(n => n[0]*vd[0]+n[1]*vd[1]+n[2]*vd[2]);
+            
+            let hasFront=false,hasBack=false;
+            for(const d of dots){
+                if(d>0) hasFront=true;
+                if(d<0) hasBack=true;
+            }
+            
+            // 轮廓边检测（曲面外轮廓）：
+            // 1. 严格轮廓：一侧朝前一侧朝后
+            // 2. 任意面法向量接近垂直视线（|dot|很小）→ 该面位于轮廓边界
+            let isSilhouette = hasFront && hasBack;
+            
+            if(!isSilhouette){
+                for(const d of dots){
+                    if(Math.abs(d)<0.1){
+                        isSilhouette=true;
+                        break;
+                    }
+                }
+            }
+            
+            // 轮廓边直接通过，非轮廓边需要是特征边
+            if(!isSilhouette && !isFeature) continue;
+            
+            // 所有边都加入 allEdges（第一层：全部画虚线）
+            viewResults[vi].all.push(a[0],a[1],a[2],b[0],b[1],b[2]);
+            
+            // 轮廓边直接标为可见（第二层：画实线覆盖）
+            if(isSilhouette){
+                viewResults[vi].vis.push(a[0],a[1],a[2],b[0],b[1],b[2]);
+                continue;
+            }
+            
+            // 特征边：Z-buffer深度测试（不透视检测）
+            const depthBuf = depthBuffers[vi];
+            let visCount=0,hidCount=0;
+            
+            for(let s=0;s<=SAMPLES;s++){
+                const t=s/SAMPLES;
+                const px=a[0]+(b[0]-a[0])*t;
+                const py=a[1]+(b[1]-a[1])*t;
+                const pz=a[2]+(b[2]-a[2])*t;
+                
+                let u,v,depth;
+                if(vi===0){ u=px; v=pz; depth=py; }
+                else if(vi===1){ u=px; v=py; depth=pz; }
+                else { u=py; v=pz; depth=px; }
+                
+                let gi,gj;
+                if(vi===0){
+                    gi=Math.floor((u-minX)/(maxX-minX)*(GRID-1));
+                    gj=Math.floor((v-minZ)/(maxZ-minZ)*(GRID-1));
+                } else if(vi===1){
+                    gi=Math.floor((u-minX)/(maxX-minX)*(GRID-1));
+                    gj=Math.floor((v-minY)/(maxY-minY)*(GRID-1));
+                } else {
+                    gi=Math.floor((u-minY)/(maxY-minY)*(GRID-1));
+                    gj=Math.floor((v-minZ)/(maxZ-minZ)*(GRID-1));
+                }
+                
+                if(gi>=0&&gi<GRID&&gj>=0&&gj<GRID){
+                    const bufDepth=depthBuf[gj*GRID+gi];
+                    if(depth<=bufDepth+depthTolerance) visCount++;
+                    else hidCount++;
+                } else {
+                    visCount++;
+                }
+            }
+            
+            // 不透视下可见 → 实线（第二层覆盖）
+            if(visCount>hidCount) viewResults[vi].vis.push(a[0],a[1],a[2],b[0],b[1],b[2]);
+        }
+    }
+    
+    return result;
+}
+
+// 光栅化三角形到深度缓冲区
+function rasterizeTriangle(tri, viewDir, depthBuf, GRID, minX,maxX,minY,maxY,minZ,maxZ){
+    const {v0,v1,v2,n} = tri;
+    
+    // 投影到2D
+    let p0u,p0v,d0, p1u,p1v,d1, p2u,p2v,d2;
+    let rangeU, rangeV;
+    
+    if(viewDir[1]!==0){ // 主视图: 投影面XZ
+        p0u=v0[0]; p0v=v0[2]; d0=v0[1];
+        p1u=v1[0]; p1v=v1[2]; d1=v1[1];
+        p2u=v2[0]; p2v=v2[2]; d2=v2[1];
+        rangeU=maxX-minX; rangeV=maxZ-minZ;
+    } else if(viewDir[2]!==0){ // 俯视图: 投影面XY
+        p0u=v0[0]; p0v=v0[1]; d0=v0[2];
+        p1u=v1[0]; p1v=v1[1]; d1=v1[2];
+        p2u=v2[0]; p2v=v2[1]; d2=v2[2];
+        rangeU=maxX-minX; rangeV=maxY-minY;
+    } else { // 左视图: 投影面YZ
+        p0u=v0[1]; p0v=v0[2]; d0=v0[0];
+        p1u=v1[1]; p1v=v1[2]; d1=v1[0];
+        p2u=v2[1]; p2v=v2[2]; d2=v2[0];
+        rangeU=maxY-minY; rangeV=maxZ-minZ;
+    }
+    
+    // 计算2D包围盒
+    const minU=Math.min(p0u,p1u,p2u), maxU=Math.max(p0u,p1u,p2u);
+    const minV=Math.min(p0v,p1v,p2v), maxV=Math.max(p0v,p1v,p2v);
+    
+    let giMin=Math.floor((minU-(viewDir[1]!==0?minX:viewDir[2]!==0?minX:minY))/rangeU*(GRID-1));
+    let giMax=Math.ceil((maxU-(viewDir[1]!==0?minX:viewDir[2]!==0?minX:minY))/rangeU*(GRID-1));
+    let gjMin=Math.floor((minV-(viewDir[1]!==0?minZ:viewDir[2]!==0?minY:minZ))/rangeV*(GRID-1));
+    let gjMax=Math.ceil((maxV-(viewDir[1]!==0?minZ:viewDir[2]!==0?minY:minZ))/rangeV*(GRID-1));
+    
+    giMin=Math.max(0,giMin); giMax=Math.min(GRID-1,giMax);
+    gjMin=Math.max(0,gjMin); gjMax=Math.min(GRID-1,gjMax);
+    
+    // 重心坐标光栅化
+    const denom=(p1v-p2v)*(p0u-p2u)+(p2u-p1u)*(p0v-p2v);
+    if(Math.abs(denom)<1e-10) return;
+    
+    for(let gj=gjMin;gj<=gjMax;gj++){
+        for(let gi=giMin;gi<=giMax;gi++){
+            // 网格中心的世界坐标
+            const wu=(viewDir[1]!==0?minX:viewDir[2]!==0?minX:minY)+(gi+0.5)/(GRID-1)*rangeU;
+            const wv=(viewDir[1]!==0?minZ:viewDir[2]!==0?minY:minZ)+(gj+0.5)/(GRID-1)*rangeV;
+            
+            const w1=((p1v-p2v)*(wu-p2u)+(p2u-p1u)*(wv-p2v))/denom;
+            const w2=((p2v-p0v)*(wu-p2u)+(p0u-p2u)*(wv-p2v))/denom;
+            const w0=1-w1-w2;
+            
+            if(w0>=0&&w1>=0&&w2>=0){
+                const depth=w0*d0+w1*d1+w2*d2;
+                const idx=gj*GRID+gi;
+                if(depth<depthBuf[idx]) depthBuf[idx]=depth;
+            }
+        }
+    }
+}
+
+function edgeKey(a,b){
+    const ka=`${a[0].toFixed(4)},${a[1].toFixed(4)},${a[2].toFixed(4)}`;
+    const kb=`${b[0].toFixed(4)},${b[1].toFixed(4)},${b[2].toFixed(4)}`;
+    return ka<kb?`${ka}|${kb}`:`${kb}|${ka}`;
+}
+
+// 每视图独立可见性判断
+function classifyEdgePerView(a,b,faceNormals,viewDir,visibleArr,hiddenArr){
+    let frontCount=0,backCount=0;
+    for(const n of faceNormals){
+        const dot=n[0]*viewDir[0]+n[1]*viewDir[1]+n[2]*viewDir[2];
+        if(dot>0.01) frontCount++;
+        else if(dot<-0.01) backCount++;
+    }
+    if(frontCount>=backCount) visibleArr.push(a[0],a[1],a[2],b[0],b[1],b[2]);
+    else hiddenArr.push(a[0],a[1],a[2],b[0],b[1],b[2]);
+}
+
+function createEdgeBuffer(data) {
+    if (!data || data.length === 0) return null;
+    const buffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(data), gl.STATIC_DRAW);
+    return { buffer, count: data.length / 3 };
+}
+
+function buildEdgeData() {
+    if (!meshData || !meshData.rawVertices || !meshData.rawNormals) return;
+    
+    const edges = extractEdges(
+        meshData.rawVertices,
+        meshData.rawNormals,
+        meshData.scale,
+        meshData.offsetX * meshData.scale,
+        meshData.offsetY * meshData.scale,
+        meshData.offsetZ * meshData.scale
+    );
+    
+    if (edgeData.frontVisible) gl.deleteBuffer(edgeData.frontVisible.buffer);
+    if (edgeData.frontHidden) gl.deleteBuffer(edgeData.frontHidden.buffer);
+    if (edgeData.frontAll) gl.deleteBuffer(edgeData.frontAll.buffer);
+    if (edgeData.topVisible) gl.deleteBuffer(edgeData.topVisible.buffer);
+    if (edgeData.topHidden) gl.deleteBuffer(edgeData.topHidden.buffer);
+    if (edgeData.topAll) gl.deleteBuffer(edgeData.topAll.buffer);
+    if (edgeData.leftVisible) gl.deleteBuffer(edgeData.leftVisible.buffer);
+    if (edgeData.leftHidden) gl.deleteBuffer(edgeData.leftHidden.buffer);
+    if (edgeData.leftAll) gl.deleteBuffer(edgeData.leftAll.buffer);
+    
+    edgeData = {
+        frontAll: createEdgeBuffer(edges.frontAll),
+        frontVisible: createEdgeBuffer(edges.frontVisible),
+        frontHidden: createEdgeBuffer(edges.frontHidden),
+        topAll: createEdgeBuffer(edges.topAll),
+        topVisible: createEdgeBuffer(edges.topVisible),
+        topHidden: createEdgeBuffer(edges.topHidden),
+        leftAll: createEdgeBuffer(edges.leftAll),
+        leftVisible: createEdgeBuffer(edges.leftVisible),
+        leftHidden: createEdgeBuffer(edges.leftHidden)
+    };
+}
+
+function renderView(allEdges, visibleEdges, viewDir, upDir, viewport) {
+    const [vx, vy, vw, vh] = viewport;
+    gl.viewport(vx, vy, vw, vh);
+    gl.scissor(vx, vy, vw, vh);
+    
+    const size = 10;
+    const aspect = vw / vh;
+    const left = -size * aspect;
+    const right = size * aspect;
+    const bottom = -size;
+    const top = size;
+    
+    const projMat = Mat4.create();
+    Mat4.ortho(projMat, left, right, bottom, top, 0.1, 100);
+    
+    const viewMat = Mat4.create();
+    const eye = [viewDir[0] * 50, viewDir[1] * 50, viewDir[2] * 50];
+    Mat4.lookAt(viewMat, eye, [0, 0, 0], upDir);
+    
+    const mvp = Mat4.create();
+    Mat4.multiply(mvp, projMat, viewMat);
+    
+    gl.useProgram(edgeProgram);
+    gl.uniformMatrix4fv(edgeU_MVP, false, mvp);
+    
+    // 第一层：所有边画为虚线（灰色细线）
+    if (allEdges && allEdges.buffer) {
+        gl.lineWidth(1.0);
+        gl.uniform4f(edgeU_Color, 0.4, 0.4, 0.4, 0.5);
+        gl.bindBuffer(gl.ARRAY_BUFFER, allEdges.buffer);
+        gl.enableVertexAttribArray(edgeAPos);
+        gl.vertexAttribPointer(edgeAPos, 3, gl.FLOAT, false, 0, 0);
+        gl.drawArrays(gl.LINES, 0, allEdges.count);
+    }
+    
+    // 第二层：可见边画为实线（白色粗线）覆盖上去
+    if (visibleEdges && visibleEdges.buffer) {
+        gl.lineWidth(2.0);
+        gl.uniform4f(edgeU_Color, 1.0, 1.0, 1.0, 1.0);
+        gl.bindBuffer(gl.ARRAY_BUFFER, visibleEdges.buffer);
+        gl.enableVertexAttribArray(edgeAPos);
+        gl.vertexAttribPointer(edgeAPos, 3, gl.FLOAT, false, 0, 0);
+        gl.drawArrays(gl.LINES, 0, visibleEdges.count);
+    }
+}
+
+function renderThreeViews() {
+    if (!showThreeViews || !meshData) return;
+    
+    gl.enable(gl.SCISSOR_TEST);
+    const w = canvas.width;
+    const h = canvas.height;
+    
+    renderView(edgeData.frontAll, edgeData.frontVisible, [0, -1, 0], [0, 0, 1], [w * 0.24, h * 0.55, w * 0.25, h * 0.35]);
+    renderView(edgeData.topAll, edgeData.topVisible, [0, 0, -1], [0, 1, 0], [w * 0.24, h * 0.18, w * 0.25, h * 0.35]);
+    renderView(edgeData.leftAll, edgeData.leftVisible, [-1, 0, 0], [0, 0, 1], [w * 0.51, h * 0.55, w * 0.25, h * 0.35]);
+    
+    gl.disable(gl.SCISSOR_TEST);
+    gl.viewport(0, 0, w, h);
+}
+
 function animate() {
     requestAnimationFrame(animate);
 
@@ -380,10 +788,23 @@ function animate() {
         
         gl.drawArrays(gl.TRIANGLES, 0, meshData.vertexCount);
     }
+    
+    // 渲染三视图
+    renderThreeViews();
 }
 
 //6. STL 文件解析
 let meshData = null;
+
+// 边线数据缓存（提前声明，供 btnClear 使用）
+let edgeData = {
+    frontVisible: null,
+    frontHidden: null,
+    topVisible: null,
+    topHidden: null,
+    leftVisible: null,
+    leftHidden: null
+};
 
 function parseSTL(text) {
     const vertices = [];
@@ -418,7 +839,10 @@ function parseSTL(text) {
         return { vertexCount: 0 };
     }
     
-    return createMeshData(vertices, normals);
+    const result = createMeshData(vertices, normals);
+    result.rawVertices = vertices;
+    result.rawNormals = normals;
+    return result;
 }
 
 function parseBinarySTL(buffer) {
@@ -451,7 +875,10 @@ function parseBinarySTL(buffer) {
         offset += 2; // 属性字节数
     }
     
-    return createMeshData(vertices, normals);
+    const result = createMeshData(vertices, normals);
+    result.rawVertices = vertices;
+    result.rawNormals = normals;
+    return result;
 }
 
 function createMeshData(vertices, normals) {
@@ -543,6 +970,7 @@ fileInput.addEventListener('change', (e) => {
                     fileInfo.textContent = `✓ ${file.name} (${meshData.vertexCount / 3} 三角面)`;
                     btnClear.style.display = 'inline-block';
                     console.log(`解析成功: ${meshData.vertexCount / 3} 三角面, 缩放: ${meshData.scale}`);
+                    buildEdgeData();
                 } else {
                     fileInfo.textContent = '✗ 未找到几何数据';
                     console.error('解析失败: 未找到顶点数据');
@@ -566,6 +994,21 @@ btnClear.addEventListener('click', () => {
     if (meshData && meshData.vbo) {
         gl.deleteBuffer(meshData.vbo);
     }
+    // 清理边线数据
+    if (edgeData.frontVisible) gl.deleteBuffer(edgeData.frontVisible.buffer);
+    if (edgeData.frontHidden) gl.deleteBuffer(edgeData.frontHidden.buffer);
+    if (edgeData.topVisible) gl.deleteBuffer(edgeData.topVisible.buffer);
+    if (edgeData.topHidden) gl.deleteBuffer(edgeData.topHidden.buffer);
+    if (edgeData.leftVisible) gl.deleteBuffer(edgeData.leftVisible.buffer);
+    if (edgeData.leftHidden) gl.deleteBuffer(edgeData.leftHidden.buffer);
+    edgeData = {
+        frontVisible: null,
+        frontHidden: null,
+        topVisible: null,
+        topHidden: null,
+        leftVisible: null,
+        leftHidden: null
+    };
     meshData = null;
     fileInput.value = '';
     fileInfo.textContent = '';

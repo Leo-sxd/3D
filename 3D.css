@@ -35,3 +35,39 @@ canvas:active { cursor: grabbing; }
     color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 12px;
 }
 #filePanel .btn-clear:hover { background: #a93226; }
+#filePanel .btn-views {
+    display: inline-block; margin-top: 6px; margin-left: 6px; padding: 4px 10px; background: #27ae60;
+    color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 12px;
+}
+#filePanel .btn-views:hover { background: #229954; }
+#filePanel .btn-views.active { background: #e67e22; }
+#filePanel .btn-views.active:hover { background: #d35400; }
+
+/* 三视图背景 */
+.view-bg {
+    position: absolute;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 4px;
+    pointer-events: none;
+    display: none;
+}
+#viewFrontBg {
+    top: 10%;
+    left: 24%;
+    width: 25%;
+    height: 35%;
+}
+#viewTopBg {
+    top: 47%;
+    left: 24%;
+    width: 25%;
+    height: 35%;
+}
+#viewLeftBg {
+    top: 10%;
+    left: 51%;
+    width: 25%;
+    height: 35%;
+}
+.view-bg.show { display: block; }
