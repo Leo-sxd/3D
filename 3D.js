@@ -412,19 +412,32 @@ function extractEdges(vertices, normals, scale, offsetX, offsetY, offsetZ) {
         }
     }
     
-    // 为每个视图构建深度缓冲区
+    // 为每个视图构建双深度缓冲区
+    // frontBuf: 只用朝前三角形 → 代表"不透视下可见的表面"
+    // fullBuf: 用所有三角形 → 代表"完整表面覆盖，无间隙"
     const viewDirs=[[0,-1,0],[0,0,-1],[-1,0,0]];
-    const depthBuffers = [];
+    const frontDepthBuffers = [];
+    const fullDepthBuffers = [];
     
     for(const vd of viewDirs){
-        const depthBuf = new Float64Array(GRID * GRID);
-        for(let i=0;i<GRID*GRID;i++) depthBuf[i]=Infinity;
-        
-        // 光栅化所有三角形到深度缓冲区
-        for(const tri of triangles){
-            rasterizeTriangle(tri, vd, depthBuf, GRID, minX,maxX,minY,maxY,minZ,maxZ);
+        const frontBuf = new Float64Array(GRID * GRID);
+        const fullBuf = new Float64Array(GRID * GRID);
+        for(let i=0;i<GRID*GRID;i++){
+            frontBuf[i]=Infinity;
+            fullBuf[i]=Infinity;
         }
-        depthBuffers.push(depthBuf);
+        
+        for(const tri of triangles){
+            const dot = tri.n[0]*vd[0]+tri.n[1]*vd[1]+tri.n[2]*vd[2];
+            // 所有三角形写入 fullBuf（完整覆盖）
+            rasterizeTriangle(tri, vd, fullBuf, GRID, minX,maxX,minY,maxY,minZ,maxZ);
+            // 朝前三角形额外写入 frontBuf（可见表面）
+            if(dot>0){
+                rasterizeTriangle(tri, vd, frontBuf, GRID, minX,maxX,minY,maxY,minZ,maxZ);
+            }
+        }
+        frontDepthBuffers.push(frontBuf);
+        fullDepthBuffers.push(fullBuf);
     }
     
     const result={frontAll:[],frontVisible:[],frontHidden:[],topAll:[],topVisible:[],topHidden:[],leftAll:[],leftVisible:[],leftHidden:[]};
@@ -483,14 +496,12 @@ function extractEdges(vertices, normals, scale, offsetX, offsetY, offsetZ) {
             // 所有边都加入 allEdges（第一层：全部画虚线）
             viewResults[vi].all.push(a[0],a[1],a[2],b[0],b[1],b[2]);
             
-            // 轮廓边直接标为可见（第二层：画实线覆盖）
-            if(isSilhouette){
-                viewResults[vi].vis.push(a[0],a[1],a[2],b[0],b[1],b[2]);
-                continue;
-            }
+            // 前置过滤：所有面都朝后的边，在完全不透视下不可见，跳过实线判定
+            if(!hasFront) continue;
             
-            // 特征边：Z-buffer深度测试（不透视检测）
-            const depthBuf = depthBuffers[vi];
+            // 有朝前面的边，进行双深度缓冲区测试
+            const frontBuf = frontDepthBuffers[vi];
+            const fullBuf = fullDepthBuffers[vi];
             let visCount=0,hidCount=0;
             
             for(let s=0;s<=SAMPLES;s++){
@@ -517,9 +528,43 @@ function extractEdges(vertices, normals, scale, offsetX, offsetY, offsetZ) {
                 }
                 
                 if(gi>=0&&gi<GRID&&gj>=0&&gj<GRID){
-                    const bufDepth=depthBuf[gj*GRID+gi];
-                    if(depth<=bufDepth+depthTolerance) visCount++;
-                    else hidCount++;
+                    const idx=gj*GRID+gi;
+                    const fDepth=frontBuf[idx];
+                    const bDepth=fullBuf[idx];
+                    
+                    // 优先检查 frontBuf（朝前三角形）
+                    if(fDepth!==Infinity){
+                        // 边深度 ≈ 朝前表面深度 → 在可见表面上
+                        if(Math.abs(depth-fDepth)<=depthTolerance*2){
+                            visCount++;
+                        } else if(depth>fDepth+depthTolerance){
+                            // 边深度 > 朝前表面 → 被遮挡
+                            hidCount++;
+                        } else {
+                            // 边深度略小于朝前表面（可能在表面前方）→ 可见
+                            visCount++;
+                        }
+                    } else if(bDepth!==Infinity){
+                        // frontBuf 为 Infinity（间隙），回退检查 fullBuf
+                        // 边深度 ≈ 完整表面深度 → 在表面上（可能是背面）
+                        if(Math.abs(depth-bDepth)<=depthTolerance*2){
+                            // 检查该位置是否有朝前面：如果 fullBuf 深度比边深度大很多，说明边在背面
+                            if(depth<bDepth-depthTolerance*3){
+                                // 边在背面（深度比表面小，但在背面方向）
+                                hidCount++;
+                            } else {
+                                visCount++;
+                            }
+                        } else if(depth>bDepth+depthTolerance){
+                            // 边在表面后方 → 被遮挡
+                            hidCount++;
+                        } else {
+                            visCount++;
+                        }
+                    } else {
+                        // 两个缓冲区都是 Infinity → 超出模型范围
+                        visCount++;
+                    }
                 } else {
                     visCount++;
                 }
@@ -561,6 +606,9 @@ function rasterizeTriangle(tri, viewDir, depthBuf, GRID, minX,maxX,minY,maxY,min
     // 计算2D包围盒
     const minU=Math.min(p0u,p1u,p2u), maxU=Math.max(p0u,p1u,p2u);
     const minV=Math.min(p0v,p1v,p2v), maxV=Math.max(p0v,p1v,p2v);
+    
+    // 防止除零
+    if(rangeU<1e-10||rangeV<1e-10) return;
     
     let giMin=Math.floor((minU-(viewDir[1]!==0?minX:viewDir[2]!==0?minX:minY))/rangeU*(GRID-1));
     let giMax=Math.ceil((maxU-(viewDir[1]!==0?minX:viewDir[2]!==0?minX:minY))/rangeU*(GRID-1));
@@ -679,6 +727,9 @@ function renderView(allEdges, visibleEdges, viewDir, upDir, viewport) {
     gl.useProgram(edgeProgram);
     gl.uniformMatrix4fv(edgeU_MVP, false, mvp);
     
+    // 禁用深度测试，确保两层都能绘制
+    gl.disable(gl.DEPTH_TEST);
+    
     // 第一层：所有边画为虚线（灰色细线）
     if (allEdges && allEdges.buffer) {
         gl.lineWidth(1.0);
@@ -698,6 +749,9 @@ function renderView(allEdges, visibleEdges, viewDir, upDir, viewport) {
         gl.vertexAttribPointer(edgeAPos, 3, gl.FLOAT, false, 0, 0);
         gl.drawArrays(gl.LINES, 0, visibleEdges.count);
     }
+    
+    // 恢复深度测试
+    gl.enable(gl.DEPTH_TEST);
 }
 
 function renderThreeViews() {
@@ -708,7 +762,7 @@ function renderThreeViews() {
     const h = canvas.height;
     
     renderView(edgeData.frontAll, edgeData.frontVisible, [0, -1, 0], [0, 0, 1], [w * 0.24, h * 0.55, w * 0.25, h * 0.35]);
-    renderView(edgeData.topAll, edgeData.topVisible, [0, 0, -1], [0, 1, 0], [w * 0.24, h * 0.18, w * 0.25, h * 0.35]);
+    renderView(edgeData.topAll, edgeData.topVisible, [0, 0, 1], [0, 1, 0], [w * 0.24, h * 0.18, w * 0.25, h * 0.35]);
     renderView(edgeData.leftAll, edgeData.leftVisible, [-1, 0, 0], [0, 0, 1], [w * 0.51, h * 0.55, w * 0.25, h * 0.35]);
     
     gl.disable(gl.SCISSOR_TEST);
