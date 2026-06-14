@@ -1,4 +1,4 @@
-// ==================== 1. 极简数学库 (替代 Three.js Math) ====================
+//1. 极简数学库
 const Mat4 = {
     create: () => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]),
     perspective(out, fovy, aspect, near, far) {
@@ -37,7 +37,7 @@ const Mat4 = {
     }
 };
 
-// ==================== 2. WebGL 初始化与着色器编译 ====================
+//2. WebGL 初始化与着色器编译
 const canvas = document.getElementById('glCanvas');
 const gl = canvas.getContext('webgl', { antialias: true, alpha: false });
 if (!gl) { alert('您的浏览器不支持 WebGL'); throw new Error('No WebGL'); }
@@ -120,7 +120,7 @@ const meshU_Color = gl.getUniformLocation(meshProgram, 'uColor');
 const meshAPos = gl.getAttribLocation(meshProgram, 'aPos');
 const meshANormal = gl.getAttribLocation(meshProgram, 'aNormal');
 
-// ==================== 3. 构建几何数据 (坐标轴 + 网格) ====================
+//3. 构建几何数据 (坐标轴 + 网格)
 // 格式: [x,y,z, r,g,b,a, ...]
 const verts = [];
 function pushLine(x0,y0,z0, x1,y1,z1, r,g,b,a) {
@@ -158,7 +158,7 @@ pushCone(0,L,0, 0,1,0, 0.27,1,0.27);
 pushCone(0,0,L, 0,0,1, 0.27,0.53,1);
 
 // 网格 (60x60, 间距1) - XY水平面(z=0)
-const G = 30;
+const G = 60;
 for(let i=-G;i<=G;i++){
     const c = i===0 ? 0.3 : 0.15;
     pushLine(i,-G,0, i,G,0, c,c,0.27,1);
@@ -180,7 +180,7 @@ gl.enable(gl.DEPTH_TEST);
 gl.clearColor(0.102, 0.102, 0.18, 1);
 const totalVerts = vertexData.length / 7;
 
-// ==================== 4. 轨道控制器 (球面坐标 + 阻尼) ====================
+//4. 轨道控制器 (球面坐标 + 阻尼)
 const state = {
     theta: Math.PI / 4,     // 水平角
     phi: Math.PI / 3,       // 垂直角
@@ -196,7 +196,7 @@ const state = {
     lastX: 0, lastY: 0
 };
 
-// 鼠标中键(滚轮按下)拖动
+//鼠标中键(滚轮按下)拖动
 canvas.addEventListener('mousedown', e => {
     if(e.button === 1) {  // 中键(滚轮)
         e.preventDefault();
@@ -219,19 +219,19 @@ window.addEventListener('mouseup', e => {
 
 window.addEventListener('mousemove', e => {
     if (state.dragging) {
-        // 旋转
+        //旋转
         const dx = e.clientX - state.lastX;
         const dy = e.clientY - state.lastY;
         state.lastX = e.clientX; state.lastY = e.clientY;
         state.targetTheta -= dx * 0.005;
         state.targetPhi = Math.max(0.05, Math.min(Math.PI - 0.05, state.targetPhi - dy * 0.005));
     } else if (state.panning) {
-        // 平移
+        //平移
         const dx = e.clientX - state.lastX;
         const dy = e.clientY - state.lastY;
         state.lastX = e.clientX; state.lastY = e.clientY;
         
-        // 计算相机坐标系的右方向和上方向 (Z轴向上)
+        //计算相机坐标系的右方向和上方向 (Z轴向上)
         const sp = Math.sin(state.phi);
         const cp = Math.cos(state.phi);
         const eye = [
@@ -240,12 +240,12 @@ window.addEventListener('mousemove', e => {
             state.radius * cp
         ];
         
-        // 前方向 (eye -> center)
+        //前方向 (eye -> center)
         const fwd = [-eye[0], -eye[1], -eye[2]];
         const fwdLen = Math.hypot(fwd[0], fwd[1], fwd[2]);
         fwd[0] /= fwdLen; fwd[1] /= fwdLen; fwd[2] /= fwdLen;
         
-        // 右方向 = forward × up(0,0,1)
+        //右方向 = forward × up(0,0,1)
         const right = [
             fwd[1] * 1 - fwd[2] * 0,
             fwd[2] * 0 - fwd[0] * 1,
@@ -256,15 +256,15 @@ window.addEventListener('mousemove', e => {
             right[0] /= rightLen; right[1] /= rightLen; right[2] /= rightLen;
         }
         
-        // 上方向 = right × forward
+        //上方向 = right × forward
         const up = [
             right[1] * fwd[2] - right[2] * fwd[1],
             right[2] * fwd[0] - right[0] * fwd[2],
             right[0] * fwd[1] - right[1] * fwd[0]
         ];
         
-        // 平移速度与距离成正比
-        // 屏幕坐标系Y向下，世界坐标系Z向上，所以dy需要取反
+        //平移速度与距离成正比
+        //屏幕坐标系Y向下，世界坐标系Z向上，所以dy需要取反
         const panSpeed = state.radius * 0.002;
         state.targetCenterX -= (right[0] * dx - up[0] * dy) * panSpeed;
         state.targetCenterY -= (right[1] * dx - up[1] * dy) * panSpeed;
@@ -292,7 +292,7 @@ canvas.addEventListener('touchmove', e => {
 }, {passive:false});
 canvas.addEventListener('touchend', ()=>{ state.dragging=false; });
 
-// ==================== 5. 渲染循环 ====================
+//==================== 5. 渲染循环 ====================
 const projMat = Mat4.create();
 const viewMat = Mat4.create();
 const mvpMat = Mat4.create();
@@ -310,7 +310,7 @@ resize();
 function animate() {
     requestAnimationFrame(animate);
 
-    // 阻尼插值
+    //阻尼插值
     state.theta += (state.targetTheta - state.theta) * state.damping;
     state.phi += (state.targetPhi - state.phi) * state.damping;
     state.radius += (state.targetRadius - state.radius) * state.damping;
@@ -318,7 +318,7 @@ function animate() {
     state.centerY += (state.targetCenterY - state.centerY) * state.damping;
     state.centerZ += (state.targetCenterZ - state.centerZ) * state.damping;
 
-    // 球面坐标 -> 相机位置 (Z轴向上)
+    //球面坐标 -> 相机位置 (Z轴向上)
     const sp = Math.sin(state.phi);
     const cp = Math.cos(state.phi);
     const eye = [
@@ -328,7 +328,7 @@ function animate() {
     ];
     Mat4.lookAt(viewMat, eye, [state.centerX, state.centerY, state.centerZ], [0,0,1]);
     
-    // MVP = Proj * View
+    //MVP = Proj * View
     const tmp = Mat4.create();
     for(let i=0;i<4;i++) for(let j=0;j<4;j++){
         tmp[j*4+i] = 0;
@@ -338,7 +338,7 @@ function animate() {
 
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
-    // 渲染线条（坐标轴+网格）
+    //渲染线条（坐标轴+网格）
     gl.useProgram(lineProgram);
     gl.uniformMatrix4fv(lineU_MVP, false, mvpMat);
     gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
@@ -348,23 +348,23 @@ function animate() {
     gl.vertexAttribPointer(lineAColor, 4, gl.FLOAT, false, STRIDE, 12);
     gl.drawArrays(gl.LINES, 0, totalVerts);
 
-    // 渲染网格模型
+    //渲染网格模型
     if (meshData && meshData.vbo) {
         gl.useProgram(meshProgram);
         
-        // 计算模型矩阵（缩放+平移）
+        //计算模型矩阵（缩放+平移）
         const m = Mat4.create();
-        // 缩放
+        //缩放
         m[0] = meshData.scale;
         m[5] = meshData.scale;
         m[10] = meshData.scale;
-        // 平移（偏移量需要乘以缩放系数）
+        //平移（偏移量需要乘以缩放系数）
         m[12] = meshData.offsetX * meshData.scale;
         m[13] = meshData.offsetY * meshData.scale;
         m[14] = meshData.offsetZ * meshData.scale;
         modelMat.set(m);
         
-        // MVP * Model
+        //MVP * Model
         const meshMVP = Mat4.create();
         Mat4.multiply(meshMVP, mvpMat, modelMat);
         
@@ -382,14 +382,14 @@ function animate() {
     }
 }
 
-// ==================== 6. STL 文件解析 ====================
+//6. STL 文件解析
 let meshData = null;
 
 function parseSTL(text) {
     const vertices = [];
     const normals = [];
     
-    // ASCII STL 解析
+    //ASCII STL 解析
     const lines = text.split('\n');
     let currentNormal = [0, 0, 0];
     
@@ -430,13 +430,13 @@ function parseBinarySTL(buffer) {
     
     let offset = 84;
     for (let i = 0; i < vertexCount; i++) {
-        // 法向量
+        //法向量
         const nx = view.getFloat32(offset, true);
         const ny = view.getFloat32(offset + 4, true);
         const nz = view.getFloat32(offset + 8, true);
         offset += 12;
         
-        // 3个顶点
+        //3个顶点
         for (let j = 0; j < 3; j++) {
             const idx = (i * 3 + j) * 3;
             vertices[idx] = view.getFloat32(offset, true);
@@ -455,7 +455,7 @@ function parseBinarySTL(buffer) {
 }
 
 function createMeshData(vertices, normals) {
-    // 计算边界框
+    //计算边界框
     let minX = Infinity, minY = Infinity, minZ = Infinity;
     let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
     
@@ -468,7 +468,7 @@ function createMeshData(vertices, normals) {
         maxZ = Math.max(maxZ, vertices[i + 2]);
     }
     
-    // 计算缩放和偏移
+    //计算缩放和偏移
     const sizeX = maxX - minX;
     const sizeY = maxY - minY;
     const sizeZ = maxZ - minZ;
@@ -479,7 +479,7 @@ function createMeshData(vertices, normals) {
     const offsetY = -(minY + maxY) / 2;
     const offsetZ = -(minZ + maxZ) / 2;
     
-    // 合并顶点和法向量
+    //合并顶点和法向量
     const data = new Float32Array(vertices.length * 2);
     for (let i = 0; i < vertices.length / 3; i++) {
         data[i * 6] = vertices[i * 3];
@@ -504,7 +504,7 @@ function createMeshData(vertices, normals) {
     };
 }
 
-// ==================== 7. 文件上传处理 ====================
+//7. 文件上传处理
 const fileInput = document.getElementById('fileInput');
 const fileInfo = document.getElementById('fileInfo');
 const btnClear = document.getElementById('btnClear');
@@ -523,7 +523,7 @@ fileInput.addEventListener('change', (e) => {
                 const buffer = event.target.result;
                 const view = new DataView(buffer);
                 
-                // 通过文件大小判断格式：二进制 STL = 84 + 面数*50
+                //通过文件大小判断格式：二进制 STL = 84 + 面数*50
                 const numTriangles = view.getUint32(80, true);
                 const expectedBinarySize = 84 + numTriangles * 50;
                 const isBinary = (buffer.byteLength === expectedBinarySize);
@@ -572,7 +572,7 @@ btnClear.addEventListener('click', () => {
     btnClear.style.display = 'none';
 });
 
-// ==================== 8. 手势控制 (MediaPipe Hands) ====================
+//8. 手势控制 (MediaPipe Hands)
 const videoElement = document.getElementById('video');
 const gestureStatus = document.getElementById('gestureStatus');
 
@@ -594,7 +594,7 @@ function isThumbExtended(landmarks) {
            Math.hypot(thumbIp.x - thumbMcp.x, thumbIp.y - thumbMcp.y) * 1.2;
 }
 
-// 估算手部大小（用于判断距离屏幕远近）
+//估算手部大小（用于判断距离屏幕远近）
 function getHandSize(landmarks) {
     const wrist = landmarks[0];
     const middleMcp = landmarks[9];
@@ -612,35 +612,35 @@ function onResults(results) {
 
     const landmarks = results.multiHandLandmarks[0];
     
-    // 获取关键点
+    //获取关键点
     const thumbTip = landmarks[4];
     const indexTip = landmarks[8];
     const middleTip = landmarks[12];
     const ringTip = landmarks[16];
     const pinkyTip = landmarks[20];
     
-    // 手腕位置
+    //手腕位置
     const wrist = landmarks[0];
     
-    // 判断各手指是否伸出
+    //判断各手指是否伸出
     const thumbOut = isThumbExtended(landmarks);
     const indexOut = isFingerExtended(landmarks, 8, 6);
     const middleOut = isFingerExtended(landmarks, 12, 10);
     const ringOut = isFingerExtended(landmarks, 16, 14);
     const pinkyOut = isFingerExtended(landmarks, 20, 18);
     
-    // 计算拇指和食指距离
+    //计算拇指和食指距离
     const pinchDist = Math.hypot(thumbTip.x - indexTip.x, thumbTip.y - indexTip.y);
     
-    // 计算食指和中指距离
+    //计算食指和中指距离
     const peaceDist = Math.hypot(indexTip.x - middleTip.x, indexTip.y - middleTip.y);
     
-    // 手部大小（用于判断距离）
+    //手部大小（用于判断距离）
     const handSize = getHandSize(landmarks);
     
-    // 手势识别优先级：捏合 > 耶手势 > 仅食指 > 张开手掌
+    //手势识别优先级：捏合 > 耶手势 > 仅食指 > 张开手掌
     
-    // 1. 捏合手势：拇指和食指捏在一起，手部靠近/远离 -> 缩放
+    //1. 捏合手势：拇指和食指捏在一起，手部靠近/远离 -> 缩放
     if (pinchDist < 0.07) {
         if (prevPinchZ !== null) {
             // 手部变大 = 靠近屏幕 = 缩小视角
@@ -653,7 +653,7 @@ function onResults(results) {
         prevIndexX = prevIndexY = null;
         prevPeaceX = prevPeaceY = null;
     }
-    // 2. 耶手势：仅食指和中指伸出且并拢 -> 沿视角方向平移
+    //2. 耶手势：仅食指和中指伸出且并拢 -> 沿视角方向平移
     else if (indexOut && middleOut && !ringOut && !pinkyOut && peaceDist < 0.1) {
         const centerX = (indexTip.x + middleTip.x) / 2;
         const centerY = (indexTip.y + middleTip.y) / 2;
@@ -677,7 +677,7 @@ function onResults(results) {
             const uy = rz * fx - rx * fz;
             const uz = rx * fy - ry * fx;
 
-            // 屏幕dy向下为正，相机上方向取反使"上拖上移、下拖下移"
+            //屏幕dy向下为正，相机上方向取反使"上拖上移、下拖下移"
             const panSpeed = state.radius * 0.002;
             state.targetCenterX += (rx * dx + ux * dy) * panSpeed;
             state.targetCenterY += (ry * dx + uy * dy) * panSpeed;
@@ -689,7 +689,7 @@ function onResults(results) {
         prevIndexX = prevIndexY = null;
         prevPinchZ = null;
     }
-    // 3. 仅食指伸出 -> 旋转 (左划右移，右划左移)
+    //3. 仅食指伸出 -> 旋转 (左划右移，右划左移)
     else if (indexOut && !middleOut && !ringOut && !pinkyOut) {
         if (prevIndexX !== null && prevIndexY !== null) {
             const dx = (indexTip.x - prevIndexX) * 4;
@@ -703,7 +703,7 @@ function onResults(results) {
         prevPinchZ = null;
         prevPeaceX = prevPeaceY = null;
     }
-    // 4. 张开手掌：所有手指伸出 -> 仅识别，不操作
+    //4. 张开手掌：所有手指伸出 -> 仅识别，不操作
     else if (indexOut && middleOut && ringOut && pinkyOut) {
         prevIndexX = prevIndexY = null;
         prevPinchZ = null;
@@ -711,7 +711,7 @@ function onResults(results) {
         gestureStatus.textContent = '手势: 张开手掌 (已识别)';
     }
     else {
-        // 其他手势，重置状态
+        //其他手势，重置状态
         prevIndexX = prevIndexY = null;
         prevPinchZ = null;
         prevPeaceX = prevPeaceY = null;
@@ -719,7 +719,7 @@ function onResults(results) {
     }
 }
 
-// 初始化 MediaPipe Hands（带错误处理）
+//初始化 MediaPipe Hands（带错误处理）
 try {
     if (typeof Hands !== 'undefined' && typeof Camera !== 'undefined') {
         const hands = new Hands({
@@ -762,5 +762,5 @@ try {
     console.error('MediaPipe init error:', err);
 }
 
-// 启动动画循环
+//启动动画循环
 animate();
