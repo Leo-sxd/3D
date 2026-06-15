@@ -24,6 +24,49 @@
         <div class="file-info" id="fileInfo"></div>
         <button class="btn-clear" id="btnClear" style="display:none;">清除模型</button>
         <button class="btn-views" id="btnViews">三视图</button>
+        <button class="btn-outline" id="btnOutline">轮廓边</button>
+        <button class="btn-bg" id="btnBg">白底</button>
+        <button class="btn-color" id="btnColor">零件颜色</button>
+    </div>
+
+    <!-- 颜色选择面板 -->
+    <div id="colorPanel" class="color-panel" style="display:none;">
+        <div class="color-panel-title">零件颜色</div>
+        <div class="color-spectrum-wrap">
+            <canvas id="spectrumCanvas" width="220" height="200"></canvas>
+            <div class="spectrum-indicator" id="spectrumIndicator"></div>
+        </div>
+        <div class="color-hue-bar-wrap">
+            <canvas id="hueCanvas" width="220" height="20"></canvas>
+            <div class="hue-indicator" id="hueIndicator"></div>
+        </div>
+        <div class="color-rgb-row">
+            <label>R: <input type="number" id="colorR" min="0" max="255" value="153"></label>
+            <label>G: <input type="number" id="colorG" min="0" max="255" value="179"></label>
+            <label>B: <input type="number" id="colorB" min="0" max="255" value="230"></label>
+        </div>
+        <div class="color-preview-row">
+            <div class="color-preview" id="colorPreview"></div>
+            <button class="btn-color-close" id="btnColorClose">关闭</button>
+        </div>
+    </div>
+
+    <!-- 六视图按钮（展开盒子布局） -->
+    <div id="viewButtons">
+        <div class="vb-row vb-row-top">
+            <button class="view-btn" id="btnViewTop" title="俯视图">俯视</button>
+        </div>
+        <div class="vb-row vb-row-mid">
+            <button class="view-btn" id="btnViewLeft" title="左视图">左视</button>
+            <button class="view-btn vb-active" id="btnViewFront" title="主视图">主视</button>
+            <button class="view-btn" id="btnViewRight" title="右视图">右视</button>
+        </div>
+        <div class="vb-row vb-row-bot">
+            <button class="view-btn" id="btnViewBottom" title="仰视图">仰视</button>
+        </div>
+        <div class="vb-row vb-row-back">
+            <button class="view-btn" id="btnViewBack" title="背视图">背视</button>
+        </div>
     </div>
     
     <video id="video" autoplay playsinline></video>

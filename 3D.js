@@ -78,6 +78,7 @@ const VS_LINE = `
 attribute vec3 aPos;
 attribute vec4 aColor;
 uniform mat4 uMVP;
+uniform float uGridAlpha;
 varying vec4 vColor;
 void main(){
     gl_Position = uMVP * vec4(aPos, 1.0);
@@ -86,8 +87,13 @@ void main(){
 const FS_LINE = `
 precision mediump float;
 varying vec4 vColor;
+uniform float uGridAlpha;
 void main(){
-    gl_FragColor = vColor;
+    vec4 color = vColor;
+    if (uGridAlpha < 1.0) {
+        color = vec4(0.7, 0.85, 1.0, uGridAlpha);
+    }
+    gl_FragColor = color;
 }`;
 
 // GLSL 着色器源码 - 网格渲染（带光照）
@@ -108,20 +114,48 @@ precision mediump float;
 varying vec3 vNormal;
 varying vec3 vPos;
 uniform vec3 uColor;
+uniform float uAmbient;
 void main(){
     vec3 lightDir = normalize(vec3(0.5, 0.5, 1.0));
     vec3 normal = normalize(vNormal);
     float diff = max(dot(normal, lightDir), 0.0);
-    float ambient = 0.3;
-    vec3 color = uColor * (ambient + diff * 0.7);
+    // 补光：从反方向来的弱光
+    vec3 lightDir2 = normalize(vec3(-0.3, -0.2, 0.5));
+    float diff2 = max(dot(normal, lightDir2), 0.0) * 0.3;
+    vec3 color = uColor * (uAmbient + diff * 0.7 + diff2);
     gl_FragColor = vec4(color, 1.0);
+}`;
+
+// 轮廓边缘着色器（物体空间法线膨胀法 - 标准反转外壳）
+const VS_OUTLINE = `
+attribute vec3 aPos;
+attribute vec3 aNormal;
+uniform mat4 uMVP;
+uniform mat4 uModel;
+uniform float uOutlineWidth;
+void main(){
+    // 沿物体空间法线方向膨胀顶点（均匀膨胀，不会覆盖整个零件）
+    vec3 n = aNormal;
+    float len = length(n);
+    if (len > 0.0001) {
+        n = n / len;
+    }
+    vec3 expandedPos = aPos + n * uOutlineWidth;
+    gl_Position = uMVP * vec4(expandedPos, 1.0);
+}`;
+const FS_OUTLINE = `
+precision mediump float;
+void main(){
+    gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
 }`;
 
 const lineProgram = createProgram(gl, VS_LINE, FS_LINE);
 const meshProgram = createProgram(gl, VS_MESH, FS_MESH);
+const outlineProgram = createProgram(gl, VS_OUTLINE, FS_OUTLINE);
 
 // 线条程序 uniform/attribute 位置
 const lineU_MVP = gl.getUniformLocation(lineProgram, 'uMVP');
+const lineU_GridAlpha = gl.getUniformLocation(lineProgram, 'uGridAlpha');
 const lineAPos = gl.getAttribLocation(lineProgram, 'aPos');
 const lineAColor = gl.getAttribLocation(lineProgram, 'aColor');
 
@@ -129,8 +163,17 @@ const lineAColor = gl.getAttribLocation(lineProgram, 'aColor');
 const meshU_MVP = gl.getUniformLocation(meshProgram, 'uMVP');
 const meshU_Model = gl.getUniformLocation(meshProgram, 'uModel');
 const meshU_Color = gl.getUniformLocation(meshProgram, 'uColor');
+const meshU_Ambient = gl.getUniformLocation(meshProgram, 'uAmbient');
 const meshAPos = gl.getAttribLocation(meshProgram, 'aPos');
 const meshANormal = gl.getAttribLocation(meshProgram, 'aNormal');
+
+// 轮廓程序 uniform/attribute 位置
+const outlineU_MVP = gl.getUniformLocation(outlineProgram, 'uMVP');
+const outlineU_View = gl.getUniformLocation(outlineProgram, 'uView');
+const outlineU_Model = gl.getUniformLocation(outlineProgram, 'uModel');
+const outlineU_Width = gl.getUniformLocation(outlineProgram, 'uOutlineWidth');
+const outlineAPos = gl.getAttribLocation(outlineProgram, 'aPos');
+const outlineANormal = gl.getAttribLocation(outlineProgram, 'aNormal');
 
 //3. 构建几何数据 (坐标轴 + 网格)
 // 格式: [x,y,z, r,g,b,a, ...]
@@ -171,11 +214,13 @@ pushCone(0,0,L, 0,0,1, 0.27,0.53,1);
 
 // 网格 (400x400, 间距1) - XY水平面(z=0)
 const G = 200;
+const gridStartIdx = verts.length;
 for(let i=-G;i<=G;i++){
     const c = i===0 ? 0.3 : 0.15;
     pushLine(i,-G,0, i,G,0, c,c,0.27,1);
     pushLine(-G,i,0, G,i,0, c,c,0.27,1);
 }
+const gridEndIdx = verts.length;
 
 const vertexData = new Float32Array(verts);
 const vbo = gl.createBuffer();
@@ -321,7 +366,11 @@ resize();
 
 //==================== 9. 三视图功能 ====================
 let showThreeViews = false;
+let showOutline = false;
+let whiteBackground = false;
 const btnViews = document.getElementById('btnViews');
+const btnOutline = document.getElementById('btnOutline');
+const btnBg = document.getElementById('btnBg');
 const viewFrontBg = document.getElementById('viewFrontBg');
 const viewTopBg = document.getElementById('viewTopBg');
 const viewLeftBg = document.getElementById('viewLeftBg');
@@ -332,6 +381,271 @@ btnViews.addEventListener('click', () => {
     viewFrontBg.classList.toggle('show', showThreeViews);
     viewTopBg.classList.toggle('show', showThreeViews);
     viewLeftBg.classList.toggle('show', showThreeViews);
+});
+
+btnOutline.addEventListener('click', () => {
+    showOutline = !showOutline;
+    btnOutline.classList.toggle('active', showOutline);
+});
+
+btnBg.addEventListener('click', () => {
+    whiteBackground = !whiteBackground;
+    btnBg.classList.toggle('active', whiteBackground);
+    if (whiteBackground) {
+        gl.clearColor(1.0, 1.0, 1.0, 1.0); // 白色背景
+    } else {
+        gl.clearColor(0.102, 0.102, 0.18, 1); // 原来的深色背景
+    }
+});
+
+//==================== 9b. 零件颜色选择器 ====================
+let meshColor = { r: 0.6, g: 0.7, b: 0.9 }; // 默认颜色
+let colorPanelOpen = false;
+let currentH = 220, currentS = 0.33, currentV = 0.9; // 默认 HSV
+
+const btnColor = document.getElementById('btnColor');
+const colorPanel = document.getElementById('colorPanel');
+const spectrumCanvas = document.getElementById('spectrumCanvas');
+const hueCanvas = document.getElementById('hueCanvas');
+const spectrumIndicator = document.getElementById('spectrumIndicator');
+const hueIndicator = document.getElementById('hueIndicator');
+const inputR = document.getElementById('colorR');
+const inputG = document.getElementById('colorG');
+const inputB = document.getElementById('colorB');
+const colorPreview = document.getElementById('colorPreview');
+const btnColorClose = document.getElementById('btnColorClose');
+
+function rgbToHsv(r, g, b) {
+    const max = Math.max(r, g, b), min = Math.min(r, g, b);
+    let h, s, v = max;
+    const d = max - min;
+    s = max === 0 ? 0 : d / max;
+    if (max === min) { h = 0; }
+    else {
+        switch (max) {
+            case r: h = (g - b) / d + (g < b ? 6 : 0); break;
+            case g: h = (b - r) / d + 2; break;
+            case b: h = (r - g) / d + 4; break;
+        }
+        h /= 6;
+    }
+    return [h * 360, s, v];
+}
+
+function hsvToRgb(h, s, v) {
+    h /= 360;
+    let r, g, b;
+    const i = Math.floor(h * 6);
+    const f = h * 6 - i;
+    const p = v * (1 - s);
+    const q = v * (1 - f * s);
+    const t = v * (1 - (1 - f) * s);
+    switch (i % 6) {
+        case 0: r = v; g = t; b = p; break;
+        case 1: r = q; g = v; b = p; break;
+        case 2: r = p; g = v; b = t; break;
+        case 3: r = p; g = q; b = v; break;
+        case 4: r = t; g = p; b = v; break;
+        case 5: r = v; g = p; b = q; break;
+    }
+    return [r, g, b];
+}
+
+function drawSpectrum() {
+    const ctx = spectrumCanvas.getContext('2d');
+    const w = spectrumCanvas.width, h = spectrumCanvas.height;
+    const imgData = ctx.createImageData(w, h);
+    for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+            const s = x / (w - 1);
+            const v = 1 - y / (h - 1);
+            const [r, g, b] = hsvToRgb(currentH, s, v);
+            const idx = (y * w + x) * 4;
+            imgData.data[idx] = Math.round(r * 255);
+            imgData.data[idx + 1] = Math.round(g * 255);
+            imgData.data[idx + 2] = Math.round(b * 255);
+            imgData.data[idx + 3] = 255;
+        }
+    }
+    ctx.putImageData(imgData, 0, 0);
+}
+
+function drawHueBar() {
+    const ctx = hueCanvas.getContext('2d');
+    const w = hueCanvas.width, h = hueCanvas.height;
+    const imgData = ctx.createImageData(w, h);
+    for (let x = 0; x < w; x++) {
+        const hue = x / (w - 1) * 360;
+        const [r, g, b] = hsvToRgb(hue, 1, 1);
+        for (let y = 0; y < h; y++) {
+            const idx = (y * w + x) * 4;
+            imgData.data[idx] = Math.round(r * 255);
+            imgData.data[idx + 1] = Math.round(g * 255);
+            imgData.data[idx + 2] = Math.round(b * 255);
+            imgData.data[idx + 3] = 255;
+        }
+    }
+    ctx.putImageData(imgData, 0, 0);
+}
+
+function updateSpectrumIndicator() {
+    const x = currentS * 220;
+    const y = (1 - currentV) * 200;
+    spectrumIndicator.style.left = x + 'px';
+    spectrumIndicator.style.top = y + 'px';
+}
+
+function updateHueIndicator() {
+    const x = (currentH / 360) * 220;
+    hueIndicator.style.left = x + 'px';
+}
+
+function updateRgbInputs() {
+    const [r, g, b] = hsvToRgb(currentH, currentS, currentV);
+    meshColor.r = r; meshColor.g = g; meshColor.b = b;
+    inputR.value = Math.round(r * 255);
+    inputG.value = Math.round(g * 255);
+    inputB.value = Math.round(b * 255);
+    colorPreview.style.background = `rgb(${Math.round(r*255)},${Math.round(g*255)},${Math.round(b*255)})`;
+}
+
+function applyColor() {
+    updateRgbInputs();
+}
+
+// 初始化颜色面板
+function initColorPanel() {
+    const [h, s, v] = rgbToHsv(meshColor.r, meshColor.g, meshColor.b);
+    currentH = h; currentS = s; currentV = v;
+    drawSpectrum();
+    drawHueBar();
+    updateSpectrumIndicator();
+    updateHueIndicator();
+    updateRgbInputs();
+}
+
+btnColor.addEventListener('click', () => {
+    colorPanelOpen = !colorPanelOpen;
+    colorPanel.style.display = colorPanelOpen ? 'block' : 'none';
+    btnColor.classList.toggle('active', colorPanelOpen);
+    if (colorPanelOpen) initColorPanel();
+});
+
+btnColorClose.addEventListener('click', () => {
+    colorPanelOpen = false;
+    colorPanel.style.display = 'none';
+    btnColor.classList.remove('active');
+});
+
+// 色谱点击/拖动
+let spectrumDragging = false;
+function handleSpectrumPick(e) {
+    const rect = spectrumCanvas.getBoundingClientRect();
+    const scaleX = spectrumCanvas.width / rect.width;
+    const scaleY = spectrumCanvas.height / rect.height;
+    const x = Math.max(0, Math.min(220, (e.clientX - rect.left) * scaleX));
+    const y = Math.max(0, Math.min(200, (e.clientY - rect.top) * scaleY));
+    currentS = x / 220;
+    currentV = 1 - y / 200;
+    updateSpectrumIndicator();
+    applyColor();
+}
+spectrumCanvas.addEventListener('mousedown', e => { spectrumDragging = true; handleSpectrumPick(e); });
+window.addEventListener('mousemove', e => { if (spectrumDragging) handleSpectrumPick(e); });
+window.addEventListener('mouseup', () => { spectrumDragging = false; });
+
+// 色相条点击/拖动
+let hueDragging = false;
+function handleHuePick(e) {
+    const rect = hueCanvas.getBoundingClientRect();
+    const scaleX = hueCanvas.width / rect.width;
+    const x = Math.max(0, Math.min(220, (e.clientX - rect.left) * scaleX));
+    currentH = (x / 220) * 360;
+    drawSpectrum();
+    updateHueIndicator();
+    applyColor();
+}
+hueCanvas.addEventListener('mousedown', e => { hueDragging = true; handleHuePick(e); });
+window.addEventListener('mousemove', e => { if (hueDragging) handleHuePick(e); });
+window.addEventListener('mouseup', () => { hueDragging = false; });
+
+// RGB 输入
+function onRgbInput() {
+    let r = Math.max(0, Math.min(255, parseInt(inputR.value) || 0));
+    let g = Math.max(0, Math.min(255, parseInt(inputG.value) || 0));
+    let b = Math.max(0, Math.min(255, parseInt(inputB.value) || 0));
+    meshColor.r = r / 255; meshColor.g = g / 255; meshColor.b = b / 255;
+    const [h, s, v] = rgbToHsv(meshColor.r, meshColor.g, meshColor.b);
+    currentH = h; currentS = s; currentV = v;
+    drawSpectrum();
+    updateSpectrumIndicator();
+    updateHueIndicator();
+    colorPreview.style.background = `rgb(${r},${g},${b})`;
+}
+inputR.addEventListener('input', onRgbInput);
+inputG.addEventListener('input', onRgbInput);
+inputB.addEventListener('input', onRgbInput);
+
+//==================== 10. 六视图按钮功能 ====================
+const viewButtons = {
+    front: document.getElementById('btnViewFront'),
+    back: document.getElementById('btnViewBack'),
+    left: document.getElementById('btnViewLeft'),
+    right: document.getElementById('btnViewRight'),
+    top: document.getElementById('btnViewTop'),
+    bottom: document.getElementById('btnViewBottom')
+};
+
+// 六视图对应的球面坐标角度
+const viewAngles = {
+    front:  { theta: -Math.PI/2, phi: Math.PI/2 },  // 主视图：从-Y看向+Y
+    back:   { theta: Math.PI/2,  phi: Math.PI/2 },  // 背视图：从+Y看向-Y
+    left:   { theta: Math.PI,    phi: Math.PI/2 },  // 左视图：从-X看向+X
+    right:  { theta: 0,          phi: Math.PI/2 },  // 右视图：从+X看向-X
+    top:    { theta: 0,          phi: 0 },           // 俯视图：从+Z看向-Z
+    bottom: { theta: 0,          phi: Math.PI }      // 仰视图：从-Z看向+Z
+};
+
+let currentView = 'front'; // 当前激活的视图
+let animProgress = -1; // -1=空闲, 0~1=动画进度
+let animDirection = 1; // 1=主视→背视, -1=背视→主视
+
+// 更新按钮激活状态
+function updateViewButtonActive(viewName) {
+    Object.values(viewButtons).forEach(btn => btn.classList.remove('vb-active'));
+    if(viewButtons[viewName]) viewButtons[viewName].classList.add('vb-active');
+    currentView = viewName;
+}
+
+// 六视图按钮点击事件
+Object.keys(viewButtons).forEach(viewName => {
+    viewButtons[viewName].addEventListener('click', () => {
+        const angles = viewAngles[viewName];
+        
+        if(viewName === 'top' || viewName === 'bottom') {
+            // 俯视/仰视：保持当前theta，只改变phi（绕X轴旋转）
+            state.targetPhi = angles.phi;
+            animProgress = -1;
+        } else if(viewName === 'back' && currentView === 'front') {
+            // 主视→背视：沿X轴逆时针旋转180°（经过底部）
+            animProgress = 0;
+            animDirection = 1;
+        } else if(viewName === 'front' && currentView === 'back') {
+            // 背视→主视：反向旋转180°
+            animProgress = 0;
+            animDirection = -1;
+        } else {
+            // 其他视图：theta走最短路径
+            let diff = angles.theta - state.targetTheta;
+            while(diff > Math.PI) diff -= 2*Math.PI;
+            while(diff < -Math.PI) diff += 2*Math.PI;
+            state.targetTheta += diff;
+            state.targetPhi = angles.phi;
+            animProgress = -1;
+        }
+        
+        updateViewButtonActive(viewName);
+    });
 });
 
 // 边线着色器
@@ -355,7 +669,7 @@ const edgeAPos = gl.getAttribLocation(edgeProgram, 'aPos');
 
 // 从三角网格提取边线并分类（可见/隐藏）- Z-buffer方案
 function extractEdges(vertices, normals, scale, offsetX, offsetY, offsetZ) {
-    const DIHEDRAL_THRESHOLD = 0.92; // cos(23°)
+    const DIHEDRAL_THRESHOLD = 0.985; // cos(10°) - 降低阈值以捕获凹面边缘
     const GRID = 3200; // 深度缓冲区分辨率
     const SAMPLES = 1600; // 每条边采样点数
     
@@ -866,6 +1180,25 @@ function renderThreeViews() {
 function animate() {
     requestAnimationFrame(animate);
 
+    // 主视背视 180°旋转动画（经过底部）
+    if(animProgress >= 0 && animProgress < 1) {
+        animProgress += 0.012; // 动画速度
+        if(animProgress > 1) animProgress = 1;
+        
+        const t = animProgress;
+        // 前半段(0~0.5)：phi从π/2→π（向下）
+        // 后半段(0.5~1)：phi从π→π/2（向上），theta从起始→目标
+        if(t <= 0.5) {
+            const s = t * 2; // 0~1
+            state.targetPhi = Math.PI/2 + (Math.PI - Math.PI/2) * s;
+            state.targetTheta = -Math.PI/2 * animDirection; // 保持起始theta
+        } else {
+            const s = (t - 0.5) * 2; // 0~1
+            state.targetPhi = Math.PI - (Math.PI - Math.PI/2) * s;
+            state.targetTheta = (-Math.PI/2 + Math.PI * s) * animDirection;
+        }
+    }
+
     //阻尼插值
     state.theta += (state.targetTheta - state.theta) * state.damping;
     state.phi += (state.targetPhi - state.phi) * state.damping;
@@ -882,7 +1215,11 @@ function animate() {
         state.centerY + state.radius * sp * Math.sin(state.theta),
         state.centerZ + state.radius * cp
     ];
-    Mat4.lookAt(viewMat, eye, [state.centerX, state.centerY, state.centerZ], [0,0,1]);
+    // 俯视/仰视时切换up向量，避免与视线平行
+    let upDir = [0, 0, 1];
+    if (currentView === 'top') upDir = [0, 1, 0];      // 俯视：X右，Y上
+    else if (currentView === 'bottom') upDir = [0, -1, 0]; // 仰视：X右，Y下
+    Mat4.lookAt(viewMat, eye, [state.centerX, state.centerY, state.centerZ], upDir);
     
     //MVP = Proj * View
     const tmp = Mat4.create();
@@ -902,7 +1239,18 @@ function animate() {
     gl.vertexAttribPointer(lineAPos, 3, gl.FLOAT, false, STRIDE, 0);
     gl.enableVertexAttribArray(lineAColor);
     gl.vertexAttribPointer(lineAColor, 4, gl.FLOAT, false, STRIDE, 12);
-    gl.drawArrays(gl.LINES, 0, totalVerts);
+    
+    if (whiteBackground) {
+        // 坐标轴不淡化
+        gl.uniform1f(lineU_GridAlpha, 1.0);
+        gl.drawArrays(gl.LINES, 0, gridStartIdx / 7);
+        // 网格线淡化
+        gl.uniform1f(lineU_GridAlpha, 0.15);
+        gl.drawArrays(gl.LINES, gridStartIdx / 7, totalVerts - gridStartIdx / 7);
+    } else {
+        gl.uniform1f(lineU_GridAlpha, 1.0);
+        gl.drawArrays(gl.LINES, 0, totalVerts);
+    }
 
     //渲染网格模型
     if (meshData && meshData.vbo) {
@@ -924,9 +1272,40 @@ function animate() {
         const meshMVP = Mat4.create();
         Mat4.multiply(meshMVP, mvpMat, modelMat);
         
+        // 先渲染轮廓边缘（禁用深度测试+深度写入）
+        // 轮廓边写入所有位置，但深度缓冲不变
+        if(showOutline) {
+            gl.useProgram(outlineProgram);
+            gl.uniformMatrix4fv(outlineU_MVP, false, meshMVP);
+            gl.uniformMatrix4fv(outlineU_View, false, viewMat);
+            gl.uniformMatrix4fv(outlineU_Model, false, modelMat);
+            gl.uniform1f(outlineU_Width, 0.03); // 屏幕空间膨胀宽度
+            
+            gl.bindBuffer(gl.ARRAY_BUFFER, meshData.vbo);
+            gl.enableVertexAttribArray(outlineAPos);
+            gl.vertexAttribPointer(outlineAPos, 3, gl.FLOAT, false, 24, 0);
+            gl.enableVertexAttribArray(outlineANormal);
+            gl.vertexAttribPointer(outlineANormal, 3, gl.FLOAT, false, 24, 12);
+            
+            // 禁用深度测试和深度写入
+            gl.disable(gl.DEPTH_TEST);
+            gl.depthMask(false);
+            // 只渲染背面（产生轮廓边）
+            gl.enable(gl.CULL_FACE);
+            gl.cullFace(gl.FRONT);
+            gl.drawArrays(gl.TRIANGLES, 0, meshData.vertexCount);
+            gl.disable(gl.CULL_FACE);
+            gl.enable(gl.DEPTH_TEST);
+            gl.depthMask(true);
+        }
+        
+        // 再渲染零件表面（正常深度测试，覆盖轮廓边的中心区域，只留下边缘）
+        gl.useProgram(meshProgram);
+        
         gl.uniformMatrix4fv(meshU_MVP, false, meshMVP);
         gl.uniformMatrix4fv(meshU_Model, false, modelMat);
-        gl.uniform3f(meshU_Color, 0.6, 0.7, 0.9);
+        gl.uniform3f(meshU_Color, meshColor.r, meshColor.g, meshColor.b);
+        gl.uniform1f(meshU_Ambient, whiteBackground ? 0.6 : 0.3);
         
         gl.bindBuffer(gl.ARRAY_BUFFER, meshData.vbo);
         gl.enableVertexAttribArray(meshAPos);
@@ -935,6 +1314,22 @@ function animate() {
         gl.vertexAttribPointer(meshANormal, 3, gl.FLOAT, false, 24, 12);
         
         gl.drawArrays(gl.TRIANGLES, 0, meshData.vertexCount);
+        
+        // 渲染特征边缘（锐利边缘）
+        if(showOutline && meshData.featureEdgeVbo && meshData.featureEdgeCount > 0) {
+            gl.useProgram(lineProgram);
+            gl.uniformMatrix4fv(lineU_MVP, false, meshMVP);
+            gl.uniform1f(lineU_GridAlpha, 1.0); // 特征边缘不受网格淡化影响
+            
+            gl.bindBuffer(gl.ARRAY_BUFFER, meshData.featureEdgeVbo);
+            gl.enableVertexAttribArray(lineAPos);
+            gl.vertexAttribPointer(lineAPos, 3, gl.FLOAT, false, 12, 0);
+            gl.disableVertexAttribArray(lineAColor);
+            gl.vertexAttrib4f(lineAColor, 0, 0, 0, 1);  // 黑色
+            
+            gl.lineWidth(2.0);
+            gl.drawArrays(gl.LINES, 0, meshData.featureEdgeCount * 2);
+        }
     }
     
     // 渲染三视图
@@ -1054,6 +1449,9 @@ function createMeshData(vertices, normals) {
     const offsetY = -(minY + maxY) / 2;
     const offsetZ = -(minZ + maxZ) / 2;
     
+    //检测特征边缘（锐利边缘）
+    const featureEdges = detectFeatureEdges(vertices, normals);
+    
     //合并顶点和法向量
     const data = new Float32Array(vertices.length * 2);
     for (let i = 0; i < vertices.length / 3; i++) {
@@ -1069,14 +1467,131 @@ function createMeshData(vertices, normals) {
     gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
     gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
     
+    //创建特征边缘VBO
+    let featureEdgeVbo = null;
+    if (featureEdges.length > 0) {
+        featureEdgeVbo = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, featureEdgeVbo);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(featureEdges), gl.STATIC_DRAW);
+    }
+    
     return {
         vbo,
         vertexCount: vertices.length / 3,
         scale,
         offsetX,
         offsetY,
-        offsetZ
+        offsetZ,
+        featureEdgeVbo,
+        featureEdgeCount: featureEdges.length / 6  // 每条边2个顶点，每个顶点3个分量
     };
+}
+
+//检测特征边缘（锐利边缘）
+function detectFeatureEdges(vertices, normals) {
+    const edges = [];
+    const edgeMap = new Map();  // 用于存储边和对应的三角形法向量
+    
+    //遍历所有三角形
+    const triangleCount = vertices.length / 9;  // 每个三角形9个顶点分量
+    
+    for (let i = 0; i < triangleCount; i++) {
+        const baseIdx = i * 9;
+        
+        //三角形的3个顶点
+        const v0 = [vertices[baseIdx], vertices[baseIdx + 1], vertices[baseIdx + 2]];
+        const v1 = [vertices[baseIdx + 3], vertices[baseIdx + 4], vertices[baseIdx + 5]];
+        const v2 = [vertices[baseIdx + 6], vertices[baseIdx + 7], vertices[baseIdx + 8]];
+        
+        //三角形的法向量
+        const n = [normals[baseIdx], normals[baseIdx + 1], normals[baseIdx + 2]];
+        
+        //三角形的3条边（使用顶点索引作为键）
+        const edgeKeys = [
+            createEdgeKey(v0, v1),
+            createEdgeKey(v1, v2),
+            createEdgeKey(v2, v0)
+        ];
+        
+        //将这条边的信息存储到map中
+        for (let j = 0; j < 3; j++) {
+            const key = edgeKeys[j];
+            if (!edgeMap.has(key)) {
+                edgeMap.set(key, {
+                    v0: j === 0 ? v0 : (j === 1 ? v1 : v2),
+                    v1: j === 0 ? v1 : (j === 1 ? v2 : v0),
+                    normals: [n]
+                });
+            } else {
+                edgeMap.get(key).normals.push(n);
+            }
+        }
+    }
+    
+    //检查每条边，如果两个三角形的法向量差异大，则是特征边缘
+    // 使用10度阈值 + 凹角检测，避免将曲面近似边误判为特征边
+    const angleThreshold = Math.cos(10 * Math.PI / 180);
+    
+    edgeMap.forEach((edge) => {
+        if (edge.normals.length === 2) {
+            const n1 = edge.normals[0];
+            const n2 = edge.normals[1];
+            
+            //计算法向量的点积
+            const dot = n1[0] * n2[0] + n1[1] * n2[1] + n1[2] * n2[2];
+            
+            // 计算边方向
+            const ex = edge.v1[0] - edge.v0[0];
+            const ey = edge.v1[1] - edge.v0[1];
+            const ez = edge.v1[2] - edge.v0[2];
+            const eLen = Math.hypot(ex, ey, ez);
+            if (eLen < 1e-10) return;
+            const edx = ex/eLen, edy = ey/eLen, edz = ez/eLen;
+            
+            // 凹角检测：两个法向量在边法平面上的投影是否指向彼此
+            // n1_perp = n1 - (n1·e)*e, n2_perp = n2 - (n2·e)*e
+            const n1e = n1[0]*edx + n1[1]*edy + n1[2]*edz;
+            const n2e = n2[0]*edx + n2[1]*edy + n2[2]*edz;
+            const n1px = n1[0] - n1e*edx, n1py = n1[1] - n1e*edy, n1pz = n1[2] - n1e*edz;
+            const n2px = n2[0] - n2e*edx, n2py = n2[1] - n2e*edy, n2pz = n2[2] - n2e*edz;
+            const n1pLen = Math.hypot(n1px, n1py, n1pz);
+            const n2pLen = Math.hypot(n2px, n2py, n2pz);
+            
+            let isConcave = false;
+            if (n1pLen > 1e-6 && n2pLen > 1e-6) {
+                // 凹角：两个法向量在边法平面上的投影指向相反方向（点积为负）
+                const perpDot = (n1px*n2px + n1py*n2py + n1pz*n2pz) / (n1pLen * n2pLen);
+                if (perpDot < -0.1) isConcave = true;
+            }
+            
+            // 如果是凹角边缘，用更宽松的阈值（捕获凹进去的边缘）
+            // 如果是普通特征边，用标准阈值
+            const threshold = isConcave ? Math.cos(3 * Math.PI / 180) : angleThreshold;
+            
+            if (dot < threshold) {
+                edges.push(
+                    edge.v0[0], edge.v0[1], edge.v0[2],
+                    edge.v1[0], edge.v1[1], edge.v1[2]
+                );
+            }
+        }
+    });
+    
+    return edges;
+}
+
+//创建边的唯一键（使用顶点坐标的哈希）
+function createEdgeKey(v0, v1) {
+    const precision = 1000;  // 精度
+    const p0 = [Math.round(v0[0] * precision), Math.round(v0[1] * precision), Math.round(v0[2] * precision)];
+    const p1 = [Math.round(v1[0] * precision), Math.round(v1[1] * precision), Math.round(v1[2] * precision)];
+    
+    //确保边的方向一致（小的顶点在前）
+    if (p0[0] < p1[0] || (p0[0] === p1[0] && p0[1] < p1[1]) || (p0[0] === p1[0] && p0[1] === p1[1] && p0[2] < p1[2])) {
+        return `${p0[0]},${p0[1]},${p0[2]}-${p1[0]},${p1[1]},${p1[2]}`;
+    } else {
+        return `${p1[0]},${p1[1]},${p1[2]}-${p0[0]},${p0[1]},${p0[2]}`;
+    }
 }
 
 //7. 文件上传处理
