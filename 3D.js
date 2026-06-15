@@ -356,8 +356,8 @@ const edgeAPos = gl.getAttribLocation(edgeProgram, 'aPos');
 // 从三角网格提取边线并分类（可见/隐藏）- Z-buffer方案
 function extractEdges(vertices, normals, scale, offsetX, offsetY, offsetZ) {
     const DIHEDRAL_THRESHOLD = 0.92; // cos(23°)
-    const GRID = 300; // 深度缓冲区分辨率
-    const SAMPLES = 40; // 每条边采样点数
+    const GRID = 3200; // 深度缓冲区分辨率
+    const SAMPLES = 1600; // 每条边采样点数
     
     // 收集所有三角面
     const triangles = [];
