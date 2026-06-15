@@ -412,14 +412,66 @@ function extractEdges(vertices, normals, scale, offsetX, offsetY, offsetZ) {
         }
     }
     
-    // 为每个视图构建双深度缓冲区
+    // 为每个视图构建双深度缓冲区 + 计算凸包边界边集合
     // frontBuf: 只用朝前三角形 → 代表"不透视下可见的表面"
     // fullBuf: 用所有三角形 → 代表"完整表面覆盖，无间隙"
     const viewDirs=[[0,-1,0],[0,0,-1],[-1,0,0]];
     const frontDepthBuffers = [];
     const fullDepthBuffers = [];
     
-    for(const vd of viewDirs){
+    // 每视图的凸包边界边集合（存储 edgeKey）
+    const hullEdgeSets = [];
+    
+    // 收集所有唯一顶点（去重）
+    const uniqueVerts = [];
+    const vertSet = new Set();
+    for(const tri of triangles){
+        for(const v of [tri.v0, tri.v1, tri.v2]){
+            const vk=`${v[0].toFixed(4)},${v[1].toFixed(4)},${v[2].toFixed(4)}`;
+            if(!vertSet.has(vk)){
+                vertSet.add(vk);
+                uniqueVerts.push(v);
+            }
+        }
+    }
+    
+    // Andrew's monotone chain 凸包算法 (2D)
+    function convexHull(points){
+        // points: [[x,y], ...]
+        const n=points.length;
+        if(n<3) return points.map((_,i)=>i);
+        
+        // 按 x 排序，x 相同按 y 排序
+        const idx=Array.from({length:n},(_,i)=>i);
+        idx.sort((a,b)=>{
+            if(points[a][0]!==points[b][0]) return points[a][0]-points[b][0];
+            return points[a][1]-points[b][1];
+        });
+        
+        // 叉积 (O,A,B)
+        const cross=(O,A,B)=>(A[0]-O[0])*(B[1]-O[1])-(A[1]-O[1])*(B[0]-O[0]);
+        
+        // 下凸包
+        const lower=[];
+        for(const i of idx){
+            while(lower.length>=2 && cross(points[lower[lower.length-2]],points[lower[lower.length-1]],points[i])<=0)
+                lower.pop();
+            lower.push(i);
+        }
+        // 上凸包
+        const upper=[];
+        for(const i of idx.slice().reverse()){
+            while(upper.length>=2 && cross(points[upper[upper.length-2]],points[upper[upper.length-1]],points[i])<=0)
+                upper.pop();
+            upper.push(i);
+        }
+        // 合并（去掉重复的首尾点）
+        lower.pop(); upper.pop();
+        return lower.concat(upper);
+    }
+    
+    for(let vi=0;vi<3;vi++){
+        const vd=viewDirs[vi];
         const frontBuf = new Float64Array(GRID * GRID);
         const fullBuf = new Float64Array(GRID * GRID);
         for(let i=0;i<GRID*GRID;i++){
@@ -438,6 +490,47 @@ function extractEdges(vertices, normals, scale, offsetX, offsetY, offsetZ) {
         }
         frontDepthBuffers.push(frontBuf);
         fullDepthBuffers.push(fullBuf);
+        
+        // 计算该视图的凸包
+        const proj2D = uniqueVerts.map(v=>{
+            if(vi===0) return [v[0], v[2]];       // 主视图: XZ
+            if(vi===1) return [v[0], v[1]];       // 俯视图: XY
+            return [v[1], v[2]];                   // 左视图: YZ
+        });
+        const hullIndices = convexHull(proj2D);
+        
+        // 构建凸包顶点集合 + 相邻关系
+        const hullVertSet = new Set(hullIndices);
+        const hullAdjacency = new Map(); // hullIndex -> Set of adjacent hull indices
+        const hLen = hullIndices.length;
+        for(let i=0;i<hLen;i++){
+            const a=hullIndices[i], b=hullIndices[(i+1)%hLen];
+            if(!hullAdjacency.has(a)) hullAdjacency.set(a,new Set());
+            if(!hullAdjacency.has(b)) hullAdjacency.set(b,new Set());
+            hullAdjacency.get(a).add(b);
+            hullAdjacency.get(b).add(a);
+        }
+        
+        // 收集所有在凸包上的边
+        const hullEdges = new Set();
+        for(const[key,edge]of edgeMap){
+            const{a,b}=edge;
+            // 找到 a, b 在 uniqueVerts 中的索引
+            let ai=-1, bi=-1;
+            for(let i=0;i<uniqueVerts.length;i++){
+                const v=uniqueVerts[i];
+                if(ai<0 && Math.abs(v[0]-a[0])<1e-6 && Math.abs(v[1]-a[1])<1e-6 && Math.abs(v[2]-a[2])<1e-6) ai=i;
+                if(bi<0 && Math.abs(v[0]-b[0])<1e-6 && Math.abs(v[1]-b[1])<1e-6 && Math.abs(v[2]-b[2])<1e-6) bi=i;
+                if(ai>=0 && bi>=0) break;
+            }
+            if(ai>=0 && bi>=0 && hullVertSet.has(ai) && hullVertSet.has(bi)){
+                // 检查 a, b 是否在凸包上相邻
+                if(hullAdjacency.has(ai) && hullAdjacency.get(ai).has(bi)){
+                    hullEdges.add(key);
+                }
+            }
+        }
+        hullEdgeSets.push(hullEdges);
     }
     
     const result={frontAll:[],frontVisible:[],frontHidden:[],topAll:[],topVisible:[],topHidden:[],leftAll:[],leftVisible:[],leftHidden:[]};
@@ -571,7 +664,8 @@ function extractEdges(vertices, normals, scale, offsetX, offsetY, offsetZ) {
             }
             
             // 不透视下可见 → 实线（第二层覆盖）
-            if(visCount>hidCount) viewResults[vi].vis.push(a[0],a[1],a[2],b[0],b[1],b[2]);
+            // 硬性约束：凸包边界边强制为实线
+            if(visCount>hidCount || hullEdgeSets[vi].has(key)) viewResults[vi].vis.push(a[0],a[1],a[2],b[0],b[1],b[2]);
         }
     }
     
