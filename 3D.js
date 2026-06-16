@@ -51,7 +51,7 @@ const Mat4 = {
 };
 
 const canvas = document.getElementById('glCanvas');
-const gl = canvas.getContext('webgl', { antialias: true, alpha: false });
+const gl = canvas.getContext('webgl', { antialias: true, alpha: false, stencil: true });
 if (!gl) { alert('您的浏览器不支持 WebGL'); throw new Error('No WebGL'); }
 
 function createShader(gl, type, source) {
@@ -126,20 +126,17 @@ void main(){
     gl_FragColor = vec4(color, 1.0);
 }`;
 
-// 轮廓边缘着色器（物体空间法线膨胀法 - 标准反转外壳）
+// 轮廓边缘着色器（反转外壳：沿物体空间法线膨胀，仅渲染背面）
 const VS_OUTLINE = `
 attribute vec3 aPos;
 attribute vec3 aNormal;
 uniform mat4 uMVP;
-uniform mat4 uModel;
 uniform float uOutlineWidth;
 void main(){
-    // 沿物体空间法线方向膨胀顶点（均匀膨胀，不会覆盖整个零件）
     vec3 n = aNormal;
     float len = length(n);
-    if (len > 0.0001) {
-        n = n / len;
-    }
+    if (len > 0.0001) n = n / len;
+    // 沿物体空间法线方向膨胀顶点
     vec3 expandedPos = aPos + n * uOutlineWidth;
     gl_Position = uMVP * vec4(expandedPos, 1.0);
 }`;
@@ -152,6 +149,42 @@ void main(){
 const lineProgram = createProgram(gl, VS_LINE, FS_LINE);
 const meshProgram = createProgram(gl, VS_MESH, FS_MESH);
 const outlineProgram = createProgram(gl, VS_OUTLINE, FS_OUTLINE);
+
+// GLSL 着色器源码 - 统一 Gizmo 渲染（圆环面 + 箭头）
+const VS_GIZMO = `
+attribute vec3 aPos;
+attribute vec3 aNormal;
+attribute vec4 aColor;
+uniform mat4 uMVP;
+varying vec3 vNormal;
+varying vec4 vColor;
+void main(){
+    gl_Position = uMVP * vec4(aPos, 1.0);
+    vNormal = aNormal;
+    vColor = aColor;
+}`;
+const FS_GIZMO = `
+precision mediump float;
+varying vec3 vNormal;
+varying vec4 vColor;
+uniform vec3 uLightDir;
+void main(){
+    vec3 n = normalize(vNormal);
+    float diff = max(dot(n, uLightDir), 0.0);
+    // 补光：从反方向来的弱光
+    vec3 lightDir2 = normalize(vec3(-0.3, -0.2, 0.5));
+    float diff2 = max(dot(normalize(vNormal), lightDir2), 0.0) * 0.3;
+    vec3 color = vColor.rgb * (0.5 + diff * 0.7 + diff2);
+    gl_FragColor = vec4(color, 0.9);
+}`;
+
+const gizmoProgram = createProgram(gl, VS_GIZMO, FS_GIZMO);
+if (!gizmoProgram) console.error('gizmoProgram 编译失败!');
+const gizmoU_MVP = gl.getUniformLocation(gizmoProgram, 'uMVP');
+const gizmoU_LightDir = gl.getUniformLocation(gizmoProgram, 'uLightDir');
+const gizmoAPos = gl.getAttribLocation(gizmoProgram, 'aPos');
+const gizmoANormal = gl.getAttribLocation(gizmoProgram, 'aNormal');
+const gizmoAColor = gl.getAttribLocation(gizmoProgram, 'aColor');
 
 // 线条程序 uniform/attribute 位置
 const lineU_MVP = gl.getUniformLocation(lineProgram, 'uMVP');
@@ -586,7 +619,645 @@ inputR.addEventListener('input', onRgbInput);
 inputG.addEventListener('input', onRgbInput);
 inputB.addEventListener('input', onRgbInput);
 
-//==================== 10. 六视图按钮功能 ====================
+//==================== 10. 零件交互功能 ====================
+let isHovering = false;      // 鼠标是否悬停在零件上
+let isSelected = false;      // 零件是否被选中
+let draggingGizmo = null;    // 正在拖拽的手柄轴: 'x', 'y', 'z', 'ringX', 'ringY', 'ringZ', 'arrowX', 'arrowY', 'arrowZ'
+let dragStartPos = null;     // 拖拽开始位置
+let dragStartRotation = { x: 0, y: 0, z: 0 };  // 拖拽开始时的旋转角度
+let dragStartPosition = { x: 0, y: 0, z: 0 };    // 拖拽开始时的位置
+let hoveredRing = null;      // 当前悬停的圆环: 'ringX', 'ringY', 'ringZ'
+let hoveredArrow = null;     // 当前悬停的箭头: 'arrowX', 'arrowY', 'arrowZ'
+
+// 零件的旋转和位置状态
+let meshRotation = { x: 0, y: 0, z: 0 };  // 欧拉角（弧度）
+let meshPosition = { x: 0, y: 0, z: 0 };  // 位置偏移
+
+// 射线与三角形相交检测
+function rayTriangleIntersect(rayOrigin, rayDir, v0, v1, v2) {
+    const EPSILON = 0.0000001;
+    const edge1 = [v1[0]-v0[0], v1[1]-v0[1], v1[2]-v0[2]];
+    const edge2 = [v2[0]-v0[0], v2[1]-v0[1], v2[2]-v0[2]];
+    const h = [rayDir[1]*edge2[2]-rayDir[2]*edge2[1],
+               rayDir[2]*edge2[0]-rayDir[0]*edge2[2],
+               rayDir[0]*edge2[1]-rayDir[1]*edge2[0]];
+    const a = edge1[0]*h[0]+edge1[1]*h[1]+edge1[2]*h[2];
+    if (a > -EPSILON && a < EPSILON) return null;
+    const f = 1.0 / a;
+    const s = [rayOrigin[0]-v0[0], rayOrigin[1]-v0[1], rayOrigin[2]-v0[2]];
+    const u = f * (s[0]*h[0]+s[1]*h[1]+s[2]*h[2]);
+    if (u < 0.0 || u > 1.0) return null;
+    const q = [s[1]*edge1[2]-s[2]*edge1[1],
+               s[2]*edge1[0]-s[0]*edge1[2],
+               s[0]*edge1[1]-s[1]*edge1[0]];
+    const v = f * (rayDir[0]*q[0]+rayDir[1]*q[1]+rayDir[2]*q[2]);
+    if (v < 0.0 || u + v > 1.0) return null;
+    const t = f * (edge2[0]*q[0]+edge2[1]*q[1]+edge2[2]*q[2]);
+    if (t > EPSILON) return t;
+    return null;
+}
+
+// 从屏幕坐标生成射线
+function getRayFromMouse(mouseX, mouseY) {
+    const rect = canvas.getBoundingClientRect();
+    const x = ((mouseX - rect.left) / rect.width) * 2.0 - 1.0;
+    const y = -((mouseY - rect.top) / rect.height) * 2.0 + 1.0;
+    
+    // 逆投影矩阵
+    const invProj = Mat4.create();
+    const invProjView = Mat4.create();
+    
+    // 简化：直接计算射线方向
+    const sp = Math.sin(state.phi);
+    const cp = Math.cos(state.phi);
+    const eye = [
+        state.centerX + state.radius * sp * Math.cos(state.theta),
+        state.centerY + state.radius * sp * Math.sin(state.theta),
+        state.centerZ + state.radius * cp
+    ];
+    
+    // 相机坐标系
+    const forward = [state.centerX-eye[0], state.centerY-eye[1], state.centerZ-eye[2]];
+    const fLen = Math.hypot(forward[0], forward[1], forward[2]);
+    forward[0]/=fLen; forward[1]/=fLen; forward[2]/=fLen;
+    
+    const up = [0, 0, 1];
+    const right = [forward[1]*up[2]-forward[2]*up[1],
+                   forward[2]*up[0]-forward[0]*up[2],
+                   forward[0]*up[1]-forward[1]*up[0]];
+    const rLen = Math.hypot(right[0], right[1], right[2]);
+    right[0]/=rLen; right[1]/=rLen; right[2]/=rLen;
+    
+    const camUp = [right[1]*forward[2]-right[2]*forward[1],
+                   right[2]*forward[0]-right[0]*forward[2],
+                   right[0]*forward[1]-right[1]*forward[0]];
+    
+    // 射线方向
+    const aspect = canvas.width / canvas.height;
+    const fov = Math.PI / 4;
+    const scale = Math.tan(fov / 2);
+    
+    const rayDir = [
+        forward[0] + right[0] * x * scale * aspect + camUp[0] * y * scale,
+        forward[1] + right[1] * x * scale * aspect + camUp[1] * y * scale,
+        forward[2] + right[2] * x * scale * aspect + camUp[2] * y * scale
+    ];
+    const dLen = Math.hypot(rayDir[0], rayDir[1], rayDir[2]);
+    rayDir[0]/=dLen; rayDir[1]/=dLen; rayDir[2]/=dLen;
+    
+    return { origin: eye, dir: rayDir };
+}
+
+// 检测射线与网格相交
+function checkMeshIntersection(mouseX, mouseY) {
+    if (!meshData || !meshData.rawVertices) return false;
+    
+    const ray = getRayFromMouse(mouseX, mouseY);
+    const scale = meshData.scale;
+    const ox = meshData.offsetX * scale;
+    const oy = meshData.offsetY * scale;
+    const oz = meshData.offsetZ * scale;
+    
+    // 旋转矩阵 R = Rz * Ry * Rx
+    const rx = meshRotation.x, ry = meshRotation.y, rz = meshRotation.z;
+    const crx = Math.cos(rx), srx = Math.sin(rx);
+    const cry = Math.cos(ry), sry = Math.sin(ry);
+    const crz = Math.cos(rz), srz = Math.sin(rz);
+    const r00 = cry*crz, r01 = srx*sry*crz-crx*srz, r02 = crx*sry*crz+srx*srz;
+    const r10 = cry*srz, r11 = srx*sry*srz+crx*crz, r12 = crx*sry*srz-srx*crz;
+    const r20 = -sry,    r21 = srx*cry,           r22 = crx*cry;
+    
+    const tx = ox + meshPosition.x;
+    const ty = oy + meshPosition.y;
+    const tz = oz + meshPosition.z;
+    
+    // 遍历所有三角形
+    for (let i = 0; i < meshData.rawVertices.length; i += 9) {
+        // 原始顶点（局部空间）
+        const lx0 = meshData.rawVertices[i]*scale;
+        const ly0 = meshData.rawVertices[i+1]*scale;
+        const lz0 = meshData.rawVertices[i+2]*scale;
+        const lx1 = meshData.rawVertices[i+3]*scale;
+        const ly1 = meshData.rawVertices[i+4]*scale;
+        const lz1 = meshData.rawVertices[i+5]*scale;
+        const lx2 = meshData.rawVertices[i+6]*scale;
+        const ly2 = meshData.rawVertices[i+7]*scale;
+        const lz2 = meshData.rawVertices[i+8]*scale;
+        
+        // 应用旋转和平移
+        const v0 = [r00*lx0 + r01*ly0 + r02*lz0 + tx,
+                    r10*lx0 + r11*ly0 + r12*lz0 + ty,
+                    r20*lx0 + r21*ly0 + r22*lz0 + tz];
+        const v1 = [r00*lx1 + r01*ly1 + r02*lz1 + tx,
+                    r10*lx1 + r11*ly1 + r12*lz1 + ty,
+                    r20*lx1 + r21*ly1 + r22*lz1 + tz];
+        const v2 = [r00*lx2 + r01*ly2 + r02*lz2 + tx,
+                    r10*lx2 + r11*ly2 + r12*lz2 + ty,
+                    r20*lx2 + r21*ly2 + r22*lz2 + tz];
+        
+        if (rayTriangleIntersect(ray.origin, ray.dir, v0, v1, v2)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 鼠标移动事件（悬停检测）
+canvas.addEventListener('mousemove', e => {
+    if (draggingGizmo) return;  // 拖拽手柄时不检测悬停
+    
+    const wasHovering = isHovering;
+    isHovering = checkMeshIntersection(e.clientX, e.clientY);
+    
+    // 检测圆环悬停
+    const wasHoveredRing = hoveredRing;
+    hoveredRing = checkRingHover(e.clientX, e.clientY);
+    
+    // 检测箭头悬停
+    const wasHoveredArrow = hoveredArrow;
+    hoveredArrow = checkArrowHover(e.clientX, e.clientY);
+    
+    if (isHovering !== wasHovering || hoveredRing !== wasHoveredRing || hoveredArrow !== wasHoveredArrow) {
+        canvas.style.cursor = (isHovering || hoveredRing || hoveredArrow) ? 'pointer' : 'default';
+    }
+});
+
+// 鼠标点击事件（选中/取消选中）
+canvas.addEventListener('mousedown', e => {
+    if (e.button !== 0) return;  // 只处理左键
+    
+    if (isSelected) {
+        // 已选中：优先检测手柄（箭头紧贴零件，必须先检测手柄）
+        const gizmoHit = checkGizmoIntersection(e.clientX, e.clientY);
+        if (gizmoHit) {
+            draggingGizmo = gizmoHit;
+            dragStartPos = { x: e.clientX, y: e.clientY };
+            dragStartRotation = { ...meshRotation };
+            dragStartPosition = { ...meshPosition };
+            e.preventDefault();
+            return;
+        }
+        // 未点击手柄：检测是否点击了零件
+        const meshHit = checkMeshIntersection(e.clientX, e.clientY);
+        if (meshHit) {
+            // 点击零件保持选中状态
+            return;
+        }
+        // 点击空白区域取消选中
+        isSelected = false;
+        draggingGizmo = null;
+    } else {
+        // 未选中：检测是否点击了零件
+        if (checkMeshIntersection(e.clientX, e.clientY)) {
+            isSelected = true;
+        }
+    }
+});
+
+// 鼠标释放事件
+window.addEventListener('mouseup', e => {
+    if (draggingGizmo) {
+        draggingGizmo = null;
+        dragStartPos = null;
+    }
+});
+
+// 拖拽手柄时更新旋转/位置
+window.addEventListener('mousemove', e => {
+    if (!draggingGizmo || !dragStartPos) return;
+    
+    if (draggingGizmo === 'ringX') {
+        // 绕X轴旋转
+        const dy = e.clientY - dragStartPos.y;
+        meshRotation.x = dragStartRotation.x + dy * 0.01;
+    } else if (draggingGizmo === 'ringY') {
+        // 绕Y轴旋转（取反以匹配视觉方向）
+        const dy = e.clientY - dragStartPos.y;
+        meshRotation.y = dragStartRotation.y - dy * 0.01;
+    } else if (draggingGizmo === 'ringZ') {
+        // 绕Z轴旋转
+        const dx = e.clientX - dragStartPos.x;
+        meshRotation.z = dragStartRotation.z + dx * 0.01;
+    } else if (draggingGizmo === 'x' || draggingGizmo === 'y' || draggingGizmo === 'z' ||
+               draggingGizmo === 'arrowX' || draggingGizmo === 'arrowY' || draggingGizmo === 'arrowZ') {
+        // 使用射线-平面交点计算沿轴移动
+        const currentRay = getRayFromMouse(e.clientX, e.clientY);
+        const startRay = getRayFromMouse(dragStartPos.x, dragStartPos.y);
+        
+        // 获取当前旋转矩阵的列向量（轴方向）
+        const rx = meshRotation.x, ry = meshRotation.y, rz = meshRotation.z;
+        const crx = Math.cos(rx), srx = Math.sin(rx);
+        const cry = Math.cos(ry), sry = Math.sin(ry);
+        const crz = Math.cos(rz), srz = Math.sin(rz);
+        const r00 = cry*crz, r01 = srx*sry*crz-crx*srz, r02 = crx*sry*crz+srx*srz;
+        const r10 = cry*srz, r11 = srx*sry*srz+crx*crz, r12 = crx*sry*srz-srx*crz;
+        const r20 = -sry,    r21 = srx*cry,           r22 = crx*cry;
+        
+        let axisDir;
+        if (draggingGizmo === 'x' || draggingGizmo === 'arrowX') axisDir = [r00, r10, r20];
+        else if (draggingGizmo === 'y' || draggingGizmo === 'arrowY') axisDir = [r01, r11, r21];
+        else axisDir = [r02, r12, r22];
+        
+        // 计算射线与通过几何中心、垂直于视线的平面的交点
+        // 然后投影到轴方向上
+        const center = [meshPosition.x, meshPosition.y, meshPosition.z];
+        
+        // 获取当前视图的右方向和上方向（用于构建平面）
+        const sp = Math.sin(state.phi);
+        const cp = Math.cos(state.phi);
+        const eye = [
+            state.centerX + state.radius * sp * Math.cos(state.theta),
+            state.centerY + state.radius * sp * Math.sin(state.theta),
+            state.centerZ + state.radius * cp
+        ];
+        const viewDir = [center[0]-eye[0], center[1]-eye[1], center[2]-eye[2]];
+        const viewLen = Math.hypot(viewDir[0], viewDir[1], viewDir[2]);
+        viewDir[0]/=viewLen; viewDir[1]/=viewLen; viewDir[2]/=viewLen;
+        
+        // 平面法向量 = 视线方向
+        const planeNormal = viewDir;
+        
+        // 射线与平面交点：t = (planePoint - rayOrigin) · planeNormal / (rayDir · planeNormal)
+        function rayPlaneIntersection(rayOrigin, rayDir, planePoint, planeNormal) {
+            const denom = rayDir[0]*planeNormal[0] + rayDir[1]*planeNormal[1] + rayDir[2]*planeNormal[2];
+            if (Math.abs(denom) < 1e-6) return null;
+            const t = ((planePoint[0]-rayOrigin[0])*planeNormal[0] + 
+                       (planePoint[1]-rayOrigin[1])*planeNormal[1] + 
+                       (planePoint[2]-rayOrigin[2])*planeNormal[2]) / denom;
+            return [rayOrigin[0]+rayDir[0]*t, rayOrigin[1]+rayDir[1]*t, rayOrigin[2]+rayDir[2]*t];
+        }
+        
+        const startHit = rayPlaneIntersection(startRay.origin, startRay.dir, center, planeNormal);
+        const currentHit = rayPlaneIntersection(currentRay.origin, currentRay.dir, center, planeNormal);
+        
+        if (startHit && currentHit) {
+            // 计算沿轴方向的位移
+            const displacement = [currentHit[0]-startHit[0], currentHit[1]-startHit[1], currentHit[2]-startHit[2]];
+            const axisProjection = displacement[0]*axisDir[0] + displacement[1]*axisDir[1] + displacement[2]*axisDir[2];
+            
+            meshPosition.x = dragStartPosition.x + axisProjection * axisDir[0];
+            meshPosition.y = dragStartPosition.y + axisProjection * axisDir[1];
+            meshPosition.z = dragStartPosition.z + axisProjection * axisDir[2];
+        }
+    }
+});
+
+// 检测圆环悬停
+function checkRingHover(mouseX, mouseY) {
+    if (!meshData || !isSelected) return null;
+    
+    const ray = getRayFromMouse(mouseX, mouseY);
+    
+    // 几何中心
+    const center = [meshPosition.x, meshPosition.y, meshPosition.z];
+    
+    const rx = meshRotation.x, ry = meshRotation.y, rz = meshRotation.z;
+    const crx = Math.cos(rx), srx = Math.sin(rx);
+    const cry = Math.cos(ry), sry = Math.sin(ry);
+    const crz = Math.cos(rz), srz = Math.sin(rz);
+    const r00 = cry*crz, r01 = srx*sry*crz-crx*srz, r02 = crx*sry*crz+srx*srz;
+    const r10 = cry*srz, r11 = srx*sry*srz+crx*crz, r12 = crx*sry*srz-srx*crz;
+    const r20 = -sry,    r21 = srx*cry,           r22 = crx*cry;
+    
+    // 手柄半径（与 renderGizmo 一致）
+    const partRadius = meshData.maxDist;
+    const gizmoRadius = partRadius * 1.4;
+    const ringThickness = gizmoRadius * 0.06;  // 宽度减半
+    const outerR = gizmoRadius + ringThickness;
+    const innerR = gizmoRadius - ringThickness;
+    
+    // 射线与平面交点
+    function rayPlaneIntersection(rayOrigin, rayDir, planePoint, planeNormal) {
+        const denom = rayDir[0]*planeNormal[0] + rayDir[1]*planeNormal[1] + rayDir[2]*planeNormal[2];
+        if (Math.abs(denom) < 1e-6) return null;
+        const t = ((planePoint[0]-rayOrigin[0])*planeNormal[0] + 
+                   (planePoint[1]-rayOrigin[1])*planeNormal[1] + 
+                   (planePoint[2]-rayOrigin[2])*planeNormal[2]) / denom;
+        if (t < 0) return null;  // 射线方向相反
+        return [rayOrigin[0]+rayDir[0]*t, rayOrigin[1]+rayDir[1]*t, rayOrigin[2]+rayDir[2]*t];
+    }
+    
+    // 检查射线与三个圆环平面的交点
+    const rings = [
+        { name: 'ringX', normal: [r00, r10, r20] },
+        { name: 'ringY', normal: [r01, r11, r21] },
+        { name: 'ringZ', normal: [r02, r12, r22] }
+    ];
+    
+    for (const ring of rings) {
+        const hit = rayPlaneIntersection(ray.origin, ray.dir, center, ring.normal);
+        if (hit) {
+            // 计算交点到中心的距离
+            const dx = hit[0] - center[0];
+            const dy = hit[1] - center[1];
+            const dz = hit[2] - center[2];
+            const dist = Math.hypot(dx, dy, dz);
+            
+            // 检查是否在圆环内（内半径和外半径之间）
+            if (dist >= innerR && dist <= outerR) {
+                return ring.name;
+            }
+        }
+    }
+    
+    return null;
+}
+
+// 检测箭头悬停 - 使用射线-四边形相交检测
+function checkArrowHover(mouseX, mouseY) {
+    if (!meshData || !isSelected) return null;
+    
+    const ray = getRayFromMouse(mouseX, mouseY);
+    
+    // 几何中心
+    const center = [meshPosition.x, meshPosition.y, meshPosition.z];
+    
+    const rx = meshRotation.x, ry = meshRotation.y, rz = meshRotation.z;
+    const crx = Math.cos(rx), srx = Math.sin(rx);
+    const cry = Math.cos(ry), sry = Math.sin(ry);
+    const crz = Math.cos(rz), srz = Math.sin(rz);
+    const r00 = cry*crz, r01 = srx*sry*crz-crx*srz, r02 = crx*sry*crz+srx*srz;
+    const r10 = cry*srz, r11 = srx*sry*srz+crx*crz, r12 = crx*sry*srz-srx*crz;
+    const r20 = -sry,    r21 = srx*cry,           r22 = crx*cry;
+    
+    // 手柄半径（与 renderGizmo 一致）
+    const partRadius = meshData.maxDist;
+    const gizmoRadius = partRadius * 1.4;
+    const arrowLength = partRadius * 2.0;  // 与 renderGizmo 一致
+    const arrowWidth = gizmoRadius * 0.025;  // 与 renderGizmo 一致
+    const arrowHeadLength = arrowWidth * 4;
+    const arrowHeadWidth = arrowWidth * 2.5;
+    
+    // 计算视图方向（billboard箭头的法向量）
+    const sp = Math.sin(state.phi);
+    const cp = Math.cos(state.phi);
+    const eyeX = state.centerX + state.radius * sp * Math.cos(state.theta);
+    const eyeY = state.centerY + state.radius * sp * Math.sin(state.theta);
+    const eyeZ = state.centerZ + state.radius * cp;
+    const viewDirX = center[0] - eyeX, viewDirY = center[1] - eyeY, viewDirZ = center[2] - eyeZ;
+    const viewLen = Math.hypot(viewDirX, viewDirY, viewDirZ);
+    const normViewX = viewDirX/viewLen, normViewY = viewDirY/viewLen, normViewZ = viewDirZ/viewLen;
+    
+    // 检测每个箭头（billboard四边形）
+    const axes = [
+        { name: 'arrowX', dir: [r00, r10, r20] },
+        { name: 'arrowY', dir: [r01, r11, r21] },
+        { name: 'arrowZ', dir: [r02, r12, r22] }
+    ];
+    
+    for (const axis of axes) {
+        // 计算垂直于箭头方向和视图方向的向量（作为箭头的"宽度"方向）
+        let wX = axis.dir[1] * normViewZ - axis.dir[2] * normViewY;
+        let wY = axis.dir[2] * normViewX - axis.dir[0] * normViewZ;
+        let wZ = axis.dir[0] * normViewY - axis.dir[1] * normViewX;
+        const wLen = Math.hypot(wX, wY, wZ);
+        if (wLen < 0.001) {
+            wX = axis.dir[1] * 0 - axis.dir[2] * 1;
+            wY = axis.dir[2] * 1 - axis.dir[0] * 0;
+            wZ = axis.dir[0] * 0 - axis.dir[1] * 1;
+            const wl = Math.hypot(wX, wY, wZ);
+            wX /= wl; wY /= wl; wZ /= wl;
+        } else {
+            wX /= wLen; wY /= wLen; wZ /= wLen;
+        }
+        
+        const shaftLen = arrowLength - arrowHeadLength;
+        
+        // 箭头杆四边形的四个角点
+        const baseL = [center[0] - wX*arrowWidth, center[1] - wY*arrowWidth, center[2] - wZ*arrowWidth];
+        const baseR = [center[0] + wX*arrowWidth, center[1] + wY*arrowWidth, center[2] + wZ*arrowWidth];
+        const shaftEndL = [center[0] + axis.dir[0]*shaftLen - wX*arrowWidth, center[1] + axis.dir[1]*shaftLen - wY*arrowWidth, center[2] + axis.dir[2]*shaftLen - wZ*arrowWidth];
+        const shaftEndR = [center[0] + axis.dir[0]*shaftLen + wX*arrowWidth, center[1] + axis.dir[1]*shaftLen + wY*arrowWidth, center[2] + axis.dir[2]*shaftLen + wZ*arrowWidth];
+        
+        // 箭头头部三角形
+        const tipX = center[0] + axis.dir[0] * arrowLength;
+        const tipY = center[1] + axis.dir[1] * arrowLength;
+        const tipZ = center[2] + axis.dir[2] * arrowLength;
+        const headBaseL = [center[0] + axis.dir[0]*shaftLen - wX*arrowHeadWidth, center[1] + axis.dir[1]*shaftLen - wY*arrowHeadWidth, center[2] + axis.dir[2]*shaftLen - wZ*arrowHeadWidth];
+        const headBaseR = [center[0] + axis.dir[0]*shaftLen + wX*arrowHeadWidth, center[1] + axis.dir[1]*shaftLen + wY*arrowHeadWidth, center[2] + axis.dir[2]*shaftLen + wZ*arrowHeadWidth];
+        
+        // 检测射线与箭头杆四边形的相交
+        if (rayQuadIntersect(ray.origin, ray.dir, baseL, baseR, shaftEndR, shaftEndL)) return axis.name;
+        // 检测射线与箭头头部三角形的相交
+        if (rayTriangleIntersect(ray.origin, ray.dir, headBaseL, headBaseR, [tipX, tipY, tipZ])) return axis.name;
+    }
+    
+    return null;
+}
+
+// 射线-四边形相交检测
+function rayQuadIntersect(rayOrigin, rayDir, p0, p1, p2, p3) {
+    // 四边形由两个三角形组成：p0-p1-p2 和 p0-p2-p3
+    return rayTriangleIntersect(rayOrigin, rayDir, p0, p1, p2) || 
+           rayTriangleIntersect(rayOrigin, rayDir, p0, p2, p3);
+}
+
+// 射线-三角形相交检测（Möller-Trumbore算法）
+function rayTriangleIntersect(rayOrigin, rayDir, v0, v1, v2) {
+    const EPSILON = 0.000001;
+    const edge1 = [v1[0]-v0[0], v1[1]-v0[1], v1[2]-v0[2]];
+    const edge2 = [v2[0]-v0[0], v2[1]-v0[1], v2[2]-v0[2]];
+    const h = [rayDir[1]*edge2[2]-rayDir[2]*edge2[1], rayDir[2]*edge2[0]-rayDir[0]*edge2[2], rayDir[0]*edge2[1]-rayDir[1]*edge2[0]];
+    const a = edge1[0]*h[0]+edge1[1]*h[1]+edge1[2]*h[2];
+    if (a > -EPSILON && a < EPSILON) return false;
+    const f = 1.0/a;
+    const s = [rayOrigin[0]-v0[0], rayOrigin[1]-v0[1], rayOrigin[2]-v0[2]];
+    const u = f*(s[0]*h[0]+s[1]*h[1]+s[2]*h[2]);
+    if (u < 0.0 || u > 1.0) return false;
+    const q = [s[1]*edge1[2]-s[2]*edge1[1], s[2]*edge1[0]-s[0]*edge1[2], s[0]*edge1[1]-s[1]*edge1[0]];
+    const v = f*(rayDir[0]*q[0]+rayDir[1]*q[1]+rayDir[2]*q[2]);
+    if (v < 0.0 || u+v > 1.0) return false;
+    const t = f*(edge2[0]*q[0]+edge2[1]*q[1]+edge2[2]*q[2]);
+    return t > EPSILON;
+}
+
+// 检测是否点击了变换手柄
+function checkGizmoIntersection(mouseX, mouseY) {
+    if (!meshData) return null;
+    
+    const ray = getRayFromMouse(mouseX, mouseY);
+    
+    // 几何中心与 renderGizmo 一致
+    const center = [meshPosition.x, meshPosition.y, meshPosition.z];
+    
+    const rx = meshRotation.x, ry = meshRotation.y, rz = meshRotation.z;
+    const crx = Math.cos(rx), srx = Math.sin(rx);
+    const cry = Math.cos(ry), sry = Math.sin(ry);
+    const crz = Math.cos(rz), srz = Math.sin(rz);
+    const r00 = cry*crz, r01 = srx*sry*crz-crx*srz, r02 = crx*sry*crz+srx*srz;
+    const r10 = cry*srz, r11 = srx*sry*srz+crx*crz, r12 = crx*sry*srz-srx*crz;
+    const r20 = -sry,    r21 = srx*cry,           r22 = crx*cry;
+    
+    // 手柄半径（与 renderGizmo 一致）
+    const partRadius = meshData.maxDist;
+    const gizmoRadius = partRadius * 1.4;
+    const ringThickness = gizmoRadius * 0.06;  // 宽度减半
+    const arrowLength = partRadius * 2.0;  // 与 renderGizmo 一致
+    const arrowWidth = gizmoRadius * 0.025;  // 与 renderGizmo 一致
+    const arrowHeadLength = arrowWidth * 4;
+    const arrowHeadWidth = arrowWidth * 2.5;  // 与 renderGizmo 一致
+    
+    // 计算视图方向（billboard箭头的法向量）
+    const sp = Math.sin(state.phi);
+    const cp = Math.cos(state.phi);
+    const eyeX = state.centerX + state.radius * sp * Math.cos(state.theta);
+    const eyeY = state.centerY + state.radius * sp * Math.sin(state.theta);
+    const eyeZ = state.centerZ + state.radius * cp;
+    const viewDirX = center[0] - eyeX, viewDirY = center[1] - eyeY, viewDirZ = center[2] - eyeZ;
+    const viewLen = Math.hypot(viewDirX, viewDirY, viewDirZ);
+    const normViewX = viewDirX/viewLen, normViewY = viewDirY/viewLen, normViewZ = viewDirZ/viewLen;
+    
+    // 旋转后的坐标轴方向（R的列向量）
+    const xAxisDir = [r00, r10, r20];
+    const yAxisDir = [r01, r11, r21];
+    const zAxisDir = [r02, r12, r22];
+    
+    // 检测箭头（优先检测，使用射线-四边形相交）
+    const arrows = [
+        { name: 'arrowX', dir: xAxisDir },
+        { name: 'arrowY', dir: yAxisDir },
+        { name: 'arrowZ', dir: zAxisDir }
+    ];
+    
+    for (const arrow of arrows) {
+        // 计算垂直于箭头方向和视图方向的向量（作为箭头的"宽度"方向）
+        let wX = arrow.dir[1] * normViewZ - arrow.dir[2] * normViewY;
+        let wY = arrow.dir[2] * normViewX - arrow.dir[0] * normViewZ;
+        let wZ = arrow.dir[0] * normViewY - arrow.dir[1] * normViewX;
+        const wLen = Math.hypot(wX, wY, wZ);
+        if (wLen < 0.001) {
+            wX = arrow.dir[1] * 0 - arrow.dir[2] * 1;
+            wY = arrow.dir[2] * 1 - arrow.dir[0] * 0;
+            wZ = arrow.dir[0] * 0 - arrow.dir[1] * 1;
+            const wl = Math.hypot(wX, wY, wZ);
+            wX /= wl; wY /= wl; wZ /= wl;
+        } else {
+            wX /= wLen; wY /= wLen; wZ /= wLen;
+        }
+        
+        const shaftLen = arrowLength - arrowHeadLength;
+        
+        // 箭头杆四边形的四个角点
+        const baseL = [center[0] - wX*arrowWidth, center[1] - wY*arrowWidth, center[2] - wZ*arrowWidth];
+        const baseR = [center[0] + wX*arrowWidth, center[1] + wY*arrowWidth, center[2] + wZ*arrowWidth];
+        const shaftEndL = [center[0] + arrow.dir[0]*shaftLen - wX*arrowWidth, center[1] + arrow.dir[1]*shaftLen - wY*arrowWidth, center[2] + arrow.dir[2]*shaftLen - wZ*arrowWidth];
+        const shaftEndR = [center[0] + arrow.dir[0]*shaftLen + wX*arrowWidth, center[1] + arrow.dir[1]*shaftLen + wY*arrowWidth, center[2] + arrow.dir[2]*shaftLen + wZ*arrowWidth];
+        
+        // 箭头头部三角形
+        const tipX = center[0] + arrow.dir[0] * arrowLength;
+        const tipY = center[1] + arrow.dir[1] * arrowLength;
+        const tipZ = center[2] + arrow.dir[2] * arrowLength;
+        const headBaseL = [center[0] + arrow.dir[0]*shaftLen - wX*arrowHeadWidth, center[1] + arrow.dir[1]*shaftLen - wY*arrowHeadWidth, center[2] + arrow.dir[2]*shaftLen - wZ*arrowHeadWidth];
+        const headBaseR = [center[0] + arrow.dir[0]*shaftLen + wX*arrowHeadWidth, center[1] + arrow.dir[1]*shaftLen + wY*arrowHeadWidth, center[2] + arrow.dir[2]*shaftLen + wZ*arrowHeadWidth];
+        
+        // 检测射线与箭头杆四边形的相交
+        if (rayQuadIntersect(ray.origin, ray.dir, baseL, baseR, shaftEndR, shaftEndL)) return arrow.name;
+        // 检测射线与箭头头部三角形的相交
+        if (rayTriangleIntersect(ray.origin, ray.dir, headBaseL, headBaseR, [tipX, tipY, tipZ])) return arrow.name;
+    }
+    
+    // 检测旋转环
+    const rings = [
+        { name: 'ringX', normal: xAxisDir },
+        { name: 'ringY', normal: yAxisDir },
+        { name: 'ringZ', normal: zAxisDir }
+    ];
+    
+    // 将屏幕像素容差转换为世界空间距离
+    const camDist = Math.hypot(
+        meshPosition.x - (state.centerX + state.radius * Math.sin(state.phi) * Math.cos(state.theta)),
+        meshPosition.y - (state.centerY + state.radius * Math.sin(state.phi) * Math.sin(state.theta)),
+        meshPosition.z - (state.centerZ + state.radius * Math.cos(state.phi))
+    );
+    const pixelsToWorld = camDist * Math.tan(Math.PI / 8) * 2 / canvas.height;
+    const hitThreshold = Math.max(pixelsToWorld * 12, gizmoRadius * 0.08); // 至少12像素宽
+    
+    for (const ring of rings) {
+        const dist = rayRingDistance(ray.origin, ray.dir, center, ring.normal, gizmoRadius);
+        if (dist < hitThreshold) return ring.name;
+    }
+    
+    return null;
+}
+
+// 计算射线与线段的距离
+function raySegmentDistance(rayOrigin, rayDir, segStart, segEnd) {
+    const segDir = [segEnd[0]-segStart[0], segEnd[1]-segStart[1], segEnd[2]-segStart[2]];
+    const segLen = Math.hypot(segDir[0], segDir[1], segDir[2]);
+    segDir[0]/=segLen; segDir[1]/=segLen; segDir[2]/=segLen;
+    
+    const w = [rayOrigin[0]-segStart[0], rayOrigin[1]-segStart[1], rayOrigin[2]-segStart[2]];
+    const a = rayDir[0]*rayDir[0]+rayDir[1]*rayDir[1]+rayDir[2]*rayDir[2];
+    const b = rayDir[0]*segDir[0]+rayDir[1]*segDir[1]+rayDir[2]*segDir[2];
+    const c = segDir[0]*segDir[0]+segDir[1]*segDir[1]+segDir[2]*segDir[2];
+    const d = rayDir[0]*w[0]+rayDir[1]*w[1]+rayDir[2]*w[2];
+    const e = segDir[0]*w[0]+segDir[1]*w[1]+segDir[2]*w[2];
+    
+    const denom = a*c - b*b;
+    let sN, sD = denom;
+    let tN, tD = denom;
+    
+    if (denom < 0.000001) {
+        sN = 0; sD = 1; tN = e; tD = c;
+    } else {
+        sN = (b*e - c*d);
+        tN = (a*e - b*d);
+        if (sN < 0) { sN = 0; tN = e; tD = c; }
+        else if (sN > sD) { sN = sD; tN = e + b; tD = c; }
+    }
+    
+    if (tN < 0) tN = 0;
+    else if (tN > tD * segLen) tN = segLen * tD;
+    
+    const t = (tD < 0.000001) ? 0 : tN / tD;
+    
+    const closestOnSeg = [segStart[0]+segDir[0]*t, segStart[1]+segDir[1]*t, segStart[2]+segDir[2]*t];
+    const s = (sD < 0.000001) ? 0 : sN / sD;
+    const closestOnRay = [rayOrigin[0]+rayDir[0]*s, rayOrigin[1]+rayDir[1]*s, rayOrigin[2]+rayDir[2]*s];
+    
+    return Math.hypot(closestOnRay[0]-closestOnSeg[0], closestOnRay[1]-closestOnSeg[1], closestOnRay[2]-closestOnSeg[2]);
+}
+
+// 计算射线与环的距离
+function rayRingDistance(rayOrigin, rayDir, ringCenter, ringNormal, ringRadius) {
+    // 简化：采样环上的点，找最近距离
+    const minDist = Infinity;
+    const samples = 32;
+    
+    // 找到环平面上的两个正交向量
+    let u = [0, 0, 0], v = [0, 0, 0];
+    if (Math.abs(ringNormal[0]) < 0.9) {
+        u = [0, -ringNormal[2], ringNormal[1]];
+    } else {
+        u = [-ringNormal[2], 0, ringNormal[0]];
+    }
+    const uLen = Math.hypot(u[0], u[1], u[2]);
+    u[0]/=uLen; u[1]/=uLen; u[2]/=uLen;
+    
+    v = [ringNormal[1]*u[2]-ringNormal[2]*u[1],
+         ringNormal[2]*u[0]-ringNormal[0]*u[2],
+         ringNormal[0]*u[1]-ringNormal[1]*u[0]];
+    
+    let closestDist = Infinity;
+    for (let i = 0; i < samples; i++) {
+        const angle = (i / samples) * Math.PI * 2;
+        const cos = Math.cos(angle), sin = Math.sin(angle);
+        const px = ringCenter[0] + ringRadius * (u[0]*cos + v[0]*sin);
+        const py = ringCenter[1] + ringRadius * (u[1]*cos + v[1]*sin);
+        const pz = ringCenter[2] + ringRadius * (u[2]*cos + v[2]*sin);
+        
+        // 计算点到射线的距离
+        const toPoint = [px-rayOrigin[0], py-rayOrigin[1], pz-rayOrigin[2]];
+        const proj = toPoint[0]*rayDir[0]+toPoint[1]*rayDir[1]+toPoint[2]*rayDir[2];
+        const closest = [rayOrigin[0]+rayDir[0]*proj, rayOrigin[1]+rayDir[1]*proj, rayOrigin[2]+rayDir[2]*proj];
+        const dist = Math.hypot(px-closest[0], py-closest[1], pz-closest[2]);
+        closestDist = Math.min(closestDist, dist);
+    }
+    
+    return closestDist;
+}
+
+//==================== 11. 六视图按钮功能 ====================
 const viewButtons = {
     front: document.getElementById('btnViewFront'),
     back: document.getElementById('btnViewBack'),
@@ -1177,6 +1848,198 @@ function renderThreeViews() {
     gl.viewport(0, 0, w, h);
 }
 
+// 渲染变换手柄（实心圆环面 + 实心箭头）
+function renderGizmo() {
+    if (!meshData) return;
+    
+    const s = meshData.scale;
+    
+    // 应用零件的旋转
+    const rx = meshRotation.x, ry = meshRotation.y, rz = meshRotation.z;
+    const crx = Math.cos(rx), srx = Math.sin(rx);
+    const cry = Math.cos(ry), sry = Math.sin(ry);
+    const crz = Math.cos(rz), srz = Math.sin(rz);
+    
+    // 旋转矩阵 R = Rz * Ry * Rx
+    const r00 = cry*crz, r01 = srx*sry*crz-crx*srz, r02 = crx*sry*crz+srx*srz;
+    const r10 = cry*srz, r11 = srx*sry*srz+crx*crz, r12 = crx*sry*srz-srx*crz;
+    const r20 = -sry,    r21 = srx*cry,           r22 = crx*cry;
+    
+    // 零件几何中心
+    const cx = meshPosition.x;
+    const cy = meshPosition.y;
+    const cz = meshPosition.z;
+    
+    // 基于零件几何中心到最远点距离计算手柄大小（自适应零件尺寸）
+    // 方向环半径 = 零件几何中心到最远点距离 × 1.4
+    const partRadius = meshData.maxDist;
+    const gizmoRadius = partRadius * 1.4;
+    const ringThickness = gizmoRadius * 0.06;  // 宽度减半
+    
+    // 2D箭头尺寸（billboard风格，始终面向相机）
+    // 箭头长度 = 零件几何中心到最远点距离 × 2
+    const arrowLength = partRadius * 2.0;
+    const arrowWidth = gizmoRadius * 0.025;  // 宽度减半
+    const arrowHeadLength = arrowWidth * 4;  // 箭头头部长度
+    const arrowHeadWidth = arrowWidth * 2.5;  // 箭头头部宽度
+    
+    // 计算视图方向（用于billboard箭头）
+    const sp = Math.sin(state.phi);
+    const cp = Math.cos(state.phi);
+    const eyeX = state.centerX + state.radius * sp * Math.cos(state.theta);
+    const eyeY = state.centerY + state.radius * sp * Math.sin(state.theta);
+    const eyeZ = state.centerZ + state.radius * cp;
+    const viewDirX = cx - eyeX, viewDirY = cy - eyeY, viewDirZ = cz - eyeZ;
+    const viewLen = Math.hypot(viewDirX, viewDirY, viewDirZ);
+    const normViewX = viewDirX/viewLen, normViewY = viewDirY/viewLen, normViewZ = viewDirZ/viewLen;
+    
+    // 使用统一 Gizmo 着色器
+    gl.useProgram(gizmoProgram);
+    gl.uniform3f(gizmoU_LightDir, 0.5, 0.5, 1.0);
+    gl.uniformMatrix4fv(gizmoU_MVP, false, mvpMat);
+    
+    // 启用混合实现半透明，禁用深度测试（圆环始终显示在零件上方）
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.disable(gl.DEPTH_TEST);
+    
+    // 辅助函数：生成实心圆环面顶点
+    function generateAnnulus(normalX, normalY, normalZ, colorR, colorG, colorB, isHovered) {
+        let u = [0, 0, 0], v = [0, 0, 0];
+        if (Math.abs(normalX) < 0.9) {
+            u = [0, -normalZ, normalY];
+        } else {
+            u = [-normalZ, 0, normalX];
+        }
+        const uLen = Math.hypot(u[0], u[1], u[2]);
+        u[0]/=uLen; u[1]/=uLen; u[2]/=uLen;
+        v = [normalY*u[2]-normalZ*u[1],
+             normalZ*u[0]-normalX*u[2],
+             normalX*u[1]-normalY*u[0]];
+        
+        const outerR = gizmoRadius + ringThickness;
+        const innerR = gizmoRadius - ringThickness;
+        
+        const hr = Math.min(1, colorR + 0.4);
+        const hg = Math.min(1, colorG + 0.4);
+        const hb = Math.min(1, colorB + 0.4);
+        const cr = isHovered ? hr : colorR;
+        const cg = isHovered ? hg : colorG;
+        const cb = isHovered ? hb : colorB;
+        
+        const segments = 64;
+        const verts = [];
+        for (let i = 0; i <= segments; i++) {
+            const a = (i / segments) * Math.PI * 2;
+            const cos = Math.cos(a), sin = Math.sin(a);
+            const ox = cx + (u[0]*cos + v[0]*sin) * outerR;
+            const oy = cy + (u[1]*cos + v[1]*sin) * outerR;
+            const oz = cz + (u[2]*cos + v[2]*sin) * outerR;
+            const ix = cx + (u[0]*cos + v[0]*sin) * innerR;
+            const iy = cy + (u[1]*cos + v[1]*sin) * innerR;
+            const iz = cz + (u[2]*cos + v[2]*sin) * innerR;
+            verts.push(ox, oy, oz, normalX, normalY, normalZ, cr, cg, cb, 1);
+            verts.push(ix, iy, iz, normalX, normalY, normalZ, cr, cg, cb, 1);
+        }
+        return verts;
+    }
+    
+    // 辅助函数：生成billboard 2D箭头（始终面向相机）
+    function generateArrow(dirX, dirY, dirZ, colorR, colorG, colorB, isHovered) {
+        // 计算垂直于箭头方向和视图方向的向量（作为箭头的"宽度"方向）
+        let wX = dirY * normViewZ - dirZ * normViewY;
+        let wY = dirZ * normViewX - dirX * normViewZ;
+        let wZ = dirX * normViewY - dirY * normViewX;
+        const wLen = Math.hypot(wX, wY, wZ);
+        if (wLen < 0.001) {
+            // 箭头方向与视图方向几乎平行，使用备用向量
+            wX = dirY * 0 - dirZ * 1;
+            wY = dirZ * 1 - dirX * 0;
+            wZ = dirX * 0 - dirY * 1;
+            const wl = Math.hypot(wX, wY, wZ);
+            wX /= wl; wY /= wl; wZ /= wl;
+        } else {
+            wX /= wLen; wY /= wLen; wZ /= wLen;
+        }
+        
+        const hr = Math.min(1, colorR + 0.4);
+        const hg = Math.min(1, colorG + 0.4);
+        const hb = Math.min(1, colorB + 0.4);
+        const cr = isHovered ? hr : colorR;
+        const cg = isHovered ? hg : colorG;
+        const cb = isHovered ? hb : colorB;
+        
+        const shaftLen = arrowLength - arrowHeadLength;
+        const verts = [];
+        
+        // 法向量 = 视图方向（面向相机）
+        const nx = normViewX, ny = normViewY, nz = normViewZ;
+        
+        // 箭头杆：细长四边形（2个三角形）
+        const baseL = [cx - wX*arrowWidth, cy - wY*arrowWidth, cz - wZ*arrowWidth];
+        const baseR = [cx + wX*arrowWidth, cy + wY*arrowWidth, cz + wZ*arrowWidth];
+        const shaftEndL = [cx + dirX*shaftLen - wX*arrowWidth, cy + dirY*shaftLen - wY*arrowWidth, cz + dirZ*shaftLen - wZ*arrowWidth];
+        const shaftEndR = [cx + dirX*shaftLen + wX*arrowWidth, cy + dirY*shaftLen + wY*arrowWidth, cz + dirZ*shaftLen + wZ*arrowWidth];
+        
+        // 三角形1: baseL, baseR, shaftEndR
+        verts.push(baseL[0], baseL[1], baseL[2], nx, ny, nz, cr, cg, cb, 1);
+        verts.push(baseR[0], baseR[1], baseR[2], nx, ny, nz, cr, cg, cb, 1);
+        verts.push(shaftEndR[0], shaftEndR[1], shaftEndR[2], nx, ny, nz, cr, cg, cb, 1);
+        // 三角形2: baseL, shaftEndR, shaftEndL
+        verts.push(baseL[0], baseL[1], baseL[2], nx, ny, nz, cr, cg, cb, 1);
+        verts.push(shaftEndR[0], shaftEndR[1], shaftEndR[2], nx, ny, nz, cr, cg, cb, 1);
+        verts.push(shaftEndL[0], shaftEndL[1], shaftEndL[2], nx, ny, nz, cr, cg, cb, 1);
+        
+        // 箭头头部：三角形
+        const tipX = cx + dirX * arrowLength;
+        const tipY = cy + dirY * arrowLength;
+        const tipZ = cz + dirZ * arrowLength;
+        const headBaseL = [cx + dirX*shaftLen - wX*arrowHeadWidth, cy + dirY*shaftLen - wY*arrowHeadWidth, cz + dirZ*shaftLen - wZ*arrowHeadWidth];
+        const headBaseR = [cx + dirX*shaftLen + wX*arrowHeadWidth, cy + dirY*shaftLen + wY*arrowHeadWidth, cz + dirZ*shaftLen + wZ*arrowHeadWidth];
+        
+        verts.push(headBaseL[0], headBaseL[1], headBaseL[2], nx, ny, nz, cr, cg, cb, 1);
+        verts.push(headBaseR[0], headBaseR[1], headBaseR[2], nx, ny, nz, cr, cg, cb, 1);
+        verts.push(tipX, tipY, tipZ, nx, ny, nz, cr, cg, cb, 1);
+        
+        return verts;
+    }
+    
+    // 辅助函数：绘制顶点数组
+    function drawVerts(verts) {
+        const buf = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(verts), gl.DYNAMIC_DRAW);
+        gl.enableVertexAttribArray(gizmoAPos);
+        gl.vertexAttribPointer(gizmoAPos, 3, gl.FLOAT, false, 40, 0);
+        gl.enableVertexAttribArray(gizmoANormal);
+        gl.vertexAttribPointer(gizmoANormal, 3, gl.FLOAT, false, 40, 12);
+        gl.enableVertexAttribArray(gizmoAColor);
+        gl.vertexAttribPointer(gizmoAColor, 4, gl.FLOAT, false, 40, 24);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, verts.length / 10);
+        gl.deleteBuffer(buf);
+    }
+    
+    // 绘制每个圆环（单独 draw call）
+    drawVerts(generateAnnulus(r00, r10, r20, 1, 0.27, 0.27, hoveredRing === 'ringX'));
+    drawVerts(generateAnnulus(r01, r11, r21, 0.27, 1, 0.27, hoveredRing === 'ringY'));
+    drawVerts(generateAnnulus(r02, r12, r22, 0.27, 0.53, 1, hoveredRing === 'ringZ'));
+    
+    // 绘制每个箭头（单独 draw call）
+    drawVerts(generateArrow(r00, r10, r20, 1, 0.27, 0.27, hoveredArrow === 'arrowX'));
+    drawVerts(generateArrow(r01, r11, r21, 0.27, 1, 0.27, hoveredArrow === 'arrowY'));
+    drawVerts(generateArrow(r02, r12, r22, 0.27, 0.53, 1, hoveredArrow === 'arrowZ'));
+    
+    // 恢复深度测试和深度写入，禁用混合
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthMask(true);
+    gl.disable(gl.BLEND);
+    
+    // 禁用 gizmo attribute
+    gl.disableVertexAttribArray(gizmoAPos);
+    gl.disableVertexAttribArray(gizmoANormal);
+    gl.disableVertexAttribArray(gizmoAColor);
+}
+
 function animate() {
     requestAnimationFrame(animate);
 
@@ -1229,7 +2092,7 @@ function animate() {
     }
     mvpMat.set(tmp);
 
-    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
 
     //渲染线条（坐标轴+网格）
     gl.useProgram(lineProgram);
@@ -1256,55 +2119,60 @@ function animate() {
     if (meshData && meshData.vbo) {
         gl.useProgram(meshProgram);
         
-        //计算模型矩阵（缩放+平移）
+        //计算模型矩阵（缩放+旋转+平移）
+        // 关键：旋转围绕几何中心，而非局部原点
+        // 几何中心在局部空间为 (-offsetX, -offsetY, -offsetZ)
+        // M = T(meshPosition) * R * S * T(offset)  —— 先平移到几何中心为原点，旋转，再移回
+        const s = meshData.scale;
+        
+        // 旋转矩阵 R = Rz * Ry * Rx
+        const cx = Math.cos(meshRotation.x), sx = Math.sin(meshRotation.x);
+        const cy = Math.cos(meshRotation.y), sy = Math.sin(meshRotation.y);
+        const cz = Math.cos(meshRotation.z), sz = Math.sin(meshRotation.z);
+        
+        const r00 = cy*cz, r01 = sx*sy*cz-cx*sz, r02 = cx*sy*cz+sx*sz;
+        const r10 = cy*sz, r11 = sx*sy*sz+cx*cz, r12 = cx*sy*sz-sx*cz;
+        const r20 = -sy,   r21 = sx*cy,          r22 = cx*cy;
+        
+        // 几何中心在局部空间: centerLocal = (-offsetX, -offsetY, -offsetZ)
+        // 变换: M*p = R*S*(p - centerLocal) + meshPosition
+        //       = R*S*p - R*S*centerLocal + meshPosition
+        // 所以平移 = meshPosition - R*S*centerLocal = meshPosition + R*S*offset
+        const ox = meshData.offsetX * s;
+        const oy = meshData.offsetY * s;
+        const oz = meshData.offsetZ * s;
+        
         const m = Mat4.create();
-        //缩放
-        m[0] = meshData.scale;
-        m[5] = meshData.scale;
-        m[10] = meshData.scale;
-        //平移（偏移量需要乘以缩放系数）
-        m[12] = meshData.offsetX * meshData.scale;
-        m[13] = meshData.offsetY * meshData.scale;
-        m[14] = meshData.offsetZ * meshData.scale;
+        m[0] = r00*s; m[1] = r10*s; m[2] = r20*s; m[3] = 0;
+        m[4] = r01*s; m[5] = r11*s; m[6] = r21*s; m[7] = 0;
+        m[8] = r02*s; m[9] = r12*s; m[10]= r22*s; m[11]= 0;
+        m[12]= r00*ox + r01*oy + r02*oz + meshPosition.x;
+        m[13]= r10*ox + r11*oy + r12*oz + meshPosition.y;
+        m[14]= r20*ox + r21*oy + r22*oz + meshPosition.z;
+        m[15]= 1;
         modelMat.set(m);
         
         //MVP * Model
         const meshMVP = Mat4.create();
         Mat4.multiply(meshMVP, mvpMat, modelMat);
         
-        // 先渲染轮廓边缘（禁用深度测试+深度写入）
-        // 轮廓边写入所有位置，但深度缓冲不变
-        if(showOutline) {
-            gl.useProgram(outlineProgram);
-            gl.uniformMatrix4fv(outlineU_MVP, false, meshMVP);
-            gl.uniformMatrix4fv(outlineU_View, false, viewMat);
-            gl.uniformMatrix4fv(outlineU_Model, false, modelMat);
-            gl.uniform1f(outlineU_Width, 0.03); // 屏幕空间膨胀宽度
-            
-            gl.bindBuffer(gl.ARRAY_BUFFER, meshData.vbo);
-            gl.enableVertexAttribArray(outlineAPos);
-            gl.vertexAttribPointer(outlineAPos, 3, gl.FLOAT, false, 24, 0);
-            gl.enableVertexAttribArray(outlineANormal);
-            gl.vertexAttribPointer(outlineANormal, 3, gl.FLOAT, false, 24, 12);
-            
-            // 禁用深度测试和深度写入
-            gl.disable(gl.DEPTH_TEST);
-            gl.depthMask(false);
-            // 只渲染背面（产生轮廓边）
-            gl.enable(gl.CULL_FACE);
-            gl.cullFace(gl.FRONT);
-            gl.drawArrays(gl.TRIANGLES, 0, meshData.vertexCount);
-            gl.disable(gl.CULL_FACE);
-            gl.enable(gl.DEPTH_TEST);
-            gl.depthMask(true);
-        }
+        // 高亮效果：悬停时提高亮度
+        const highlightBoost = isHovering ? 0.15 : 0;
+        const cr = Math.min(1, meshColor.r + highlightBoost);
+        const cg = Math.min(1, meshColor.g + highlightBoost);
+        const cb = Math.min(1, meshColor.b + highlightBoost);
         
-        // 再渲染零件表面（正常深度测试，覆盖轮廓边的中心区域，只留下边缘）
+        // === 使用模板缓冲实现轮廓边 ===
+        
+        // 1. 渲染零件，同时在模板缓冲中标记零件区域为1
+        gl.enable(gl.STENCIL_TEST);
+        gl.stencilFunc(gl.ALWAYS, 1, 0xFF);
+        gl.stencilMask(0xFF);
+        
         gl.useProgram(meshProgram);
-        
         gl.uniformMatrix4fv(meshU_MVP, false, meshMVP);
         gl.uniformMatrix4fv(meshU_Model, false, modelMat);
-        gl.uniform3f(meshU_Color, meshColor.r, meshColor.g, meshColor.b);
+        gl.uniform3f(meshU_Color, cr, cg, cb);
         gl.uniform1f(meshU_Ambient, whiteBackground ? 0.6 : 0.3);
         
         gl.bindBuffer(gl.ARRAY_BUFFER, meshData.vbo);
@@ -1315,7 +2183,33 @@ function animate() {
         
         gl.drawArrays(gl.TRIANGLES, 0, meshData.vertexCount);
         
-        // 渲染特征边缘（锐利边缘）
+        // 2. 渲染轮廓边：只渲染背面（反转外壳），只在模板值为0（零件外部）的像素显示
+        if(showOutline) {
+            gl.stencilFunc(gl.EQUAL, 0, 0xFF);
+            gl.stencilMask(0x00);
+            
+            gl.useProgram(outlineProgram);
+            gl.uniformMatrix4fv(outlineU_MVP, false, meshMVP);
+            gl.uniform1f(outlineU_Width, 0.75); // 轮廓线宽度0.75mm
+            
+            gl.bindBuffer(gl.ARRAY_BUFFER, meshData.vbo);
+            gl.enableVertexAttribArray(outlineAPos);
+            gl.vertexAttribPointer(outlineAPos, 3, gl.FLOAT, false, 24, 0);
+            gl.enableVertexAttribArray(outlineANormal);
+            gl.vertexAttribPointer(outlineANormal, 3, gl.FLOAT, false, 24, 12);
+            
+            // 只渲染背面（反转外壳技术的核心）
+            gl.enable(gl.CULL_FACE);
+            gl.cullFace(gl.FRONT);
+            gl.drawArrays(gl.TRIANGLES, 0, meshData.vertexCount);
+            gl.disable(gl.CULL_FACE);
+        }
+        
+        // 重置模板状态
+        gl.disable(gl.STENCIL_TEST);
+        gl.stencilMask(0xFF);
+        
+        // 渲染特征边缘（锐利边缘+凹角边缘）
         if(showOutline && meshData.featureEdgeVbo && meshData.featureEdgeCount > 0) {
             gl.useProgram(lineProgram);
             gl.uniformMatrix4fv(lineU_MVP, false, meshMVP);
@@ -1330,6 +2224,11 @@ function animate() {
             gl.lineWidth(2.0);
             gl.drawArrays(gl.LINES, 0, meshData.featureEdgeCount * 2);
         }
+    }
+    
+    // 渲染变换手柄（选中时，在零件之后渲染）
+    if (isSelected && meshData) {
+        renderGizmo();
     }
     
     // 渲染三视图
@@ -1449,6 +2348,19 @@ function createMeshData(vertices, normals) {
     const offsetY = -(minY + maxY) / 2;
     const offsetZ = -(minZ + maxZ) / 2;
     
+    // 计算几何中心到最远点的距离（用于自适应手柄大小）
+    const centerX = (minX + maxX) / 2;
+    const centerY = (minY + maxY) / 2;
+    const centerZ = (minZ + maxZ) / 2;
+    let maxDist = 0;
+    for (let i = 0; i < vertices.length; i += 3) {
+        const dx = vertices[i] - centerX;
+        const dy = vertices[i+1] - centerY;
+        const dz = vertices[i+2] - centerZ;
+        const dist = Math.hypot(dx, dy, dz);
+        if (dist > maxDist) maxDist = dist;
+    }
+    
     //检测特征边缘（锐利边缘）
     const featureEdges = detectFeatureEdges(vertices, normals);
     
@@ -1483,7 +2395,9 @@ function createMeshData(vertices, normals) {
         offsetY,
         offsetZ,
         featureEdgeVbo,
-        featureEdgeCount: featureEdges.length / 6  // 每条边2个顶点，每个顶点3个分量
+        featureEdgeCount: featureEdges.length / 6,  // 每条边2个顶点，每个顶点3个分量
+        bboxSize: { x: sizeX, y: sizeY, z: sizeZ },  // 包围盒尺寸
+        maxDist: maxDist * scale  // 几何中心到最远点的距离（已缩放）
     };
 }
 
@@ -1633,6 +2547,11 @@ fileInput.addEventListener('change', (e) => {
                     fileInfo.textContent = `✓ ${file.name} (${meshData.vertexCount / 3} 三角面)`;
                     btnClear.style.display = 'inline-block';
                     console.log(`解析成功: ${meshData.vertexCount / 3} 三角面, 缩放: ${meshData.scale}`);
+                    // 重置零件位置和旋转状态
+                    meshPosition = { x: 0, y: 0, z: 0 };
+                    meshRotation = { x: 0, y: 0, z: 0 };
+                    isSelected = false;
+                    draggingGizmo = null;
                     buildEdgeData();
                 } else {
                     fileInfo.textContent = '✗ 未找到几何数据';
@@ -1676,6 +2595,11 @@ btnClear.addEventListener('click', () => {
     fileInput.value = '';
     fileInfo.textContent = '';
     btnClear.style.display = 'none';
+    // 重置零件位置和旋转状态
+    meshPosition = { x: 0, y: 0, z: 0 };
+    meshRotation = { x: 0, y: 0, z: 0 };
+    isSelected = false;
+    draggingGizmo = null;
 });
 
 //8. 手势控制 (MediaPipe Hands)
