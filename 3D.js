@@ -1267,10 +1267,7 @@ function rayTriangleIntersect(rayOrigin, rayDir, v0, v1, v2) {
 
 // 检测鼠标是否在剖切平面上（射线-平面相交）
 function checkSectionPlaneHover(mouseX, mouseY) {
-    if (!sectionMode || !meshData) {
-        console.log('[Plane] skip: sectionMode=' + sectionMode + ' meshData=' + !!meshData);
-        return false;
-    }
+    if (!sectionMode || !meshData) return false;
     
     const ray = getRayFromMouse(mouseX, mouseY);
     const pos = sectionPlanePos;
@@ -1313,9 +1310,7 @@ function checkSectionPlaneHover(mouseX, mouseY) {
     const v = dx*t2x + dy*t2y + dz*t2z;
     const half = size / 2;
     
-    const inBounds = Math.abs(u) <= half && Math.abs(v) <= half;
-    console.log('[Plane] t=' + t.toFixed(3) + ' size=' + size.toFixed(3) + ' u=' + u.toFixed(3) + ' v=' + v.toFixed(3) + ' half=' + half.toFixed(3) + ' inBounds=' + inBounds);
-    return inBounds;
+    return Math.abs(u) <= half && Math.abs(v) <= half;
 }
 
 // 检测是否点击了变换手柄
