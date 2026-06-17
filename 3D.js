@@ -115,7 +115,13 @@ varying vec3 vNormal;
 varying vec3 vPos;
 uniform vec3 uColor;
 uniform float uAmbient;
+uniform int uClipEnabled;
+uniform vec4 uClipPlane;
 void main(){
+    if (uClipEnabled == 1) {
+        float d = dot(vPos, uClipPlane.xyz) + uClipPlane.w;
+        if (d > 0.0) discard;
+    }
     vec3 lightDir = normalize(vec3(0.5, 0.5, 1.0));
     vec3 normal = normalize(vNormal);
     float diff = max(dot(normal, lightDir), 0.0);
@@ -149,6 +155,73 @@ void main(){
 const lineProgram = createProgram(gl, VS_LINE, FS_LINE);
 const meshProgram = createProgram(gl, VS_MESH, FS_MESH);
 const outlineProgram = createProgram(gl, VS_OUTLINE, FS_OUTLINE);
+
+// GLSL 着色器源码 - 剖切平面渲染（不需要法线）
+const VS_SECTION = `
+attribute vec3 aPos;
+attribute vec4 aColor;
+uniform mat4 uMVP;
+varying vec4 vColor;
+void main(){
+    gl_Position = uMVP * vec4(aPos, 1.0);
+    vColor = aColor;
+}`;
+const FS_SECTION = `
+precision mediump float;
+varying vec4 vColor;
+void main(){
+    gl_FragColor = vColor;
+}`;
+
+// 创建剖切平面着色器程序（带完整错误检查）
+let sectionProgram = null;
+let sectionU_MVP = null;
+let sectionAPos = -1;
+let sectionAColor = -1;
+
+function initSectionProgram() {
+    const vs = gl.createShader(gl.VERTEX_SHADER);
+    gl.shaderSource(vs, VS_SECTION);
+    gl.compileShader(vs);
+    if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS)) {
+        console.error('VS_SECTION compile error:', gl.getShaderInfoLog(vs));
+        gl.deleteShader(vs);
+        return false;
+    }
+    
+    const fs = gl.createShader(gl.FRAGMENT_SHADER);
+    gl.shaderSource(fs, FS_SECTION);
+    gl.compileShader(fs);
+    if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS)) {
+        console.error('FS_SECTION compile error:', gl.getShaderInfoLog(fs));
+        gl.deleteShader(vs);
+        gl.deleteShader(fs);
+        return false;
+    }
+    
+    sectionProgram = gl.createProgram();
+    gl.attachShader(sectionProgram, vs);
+    gl.attachShader(sectionProgram, fs);
+    gl.linkProgram(sectionProgram);
+    
+    if (!gl.getProgramParameter(sectionProgram, gl.LINK_STATUS)) {
+        console.error('sectionProgram link error:', gl.getProgramInfoLog(sectionProgram));
+        gl.deleteProgram(sectionProgram);
+        sectionProgram = null;
+        gl.deleteShader(vs);
+        gl.deleteShader(fs);
+        return false;
+    }
+    
+    sectionU_MVP = gl.getUniformLocation(sectionProgram, 'uMVP');
+    sectionAPos = gl.getAttribLocation(sectionProgram, 'aPos');
+    sectionAColor = gl.getAttribLocation(sectionProgram, 'aColor');
+    
+    console.log('sectionProgram 创建成功! aPos=' + sectionAPos + ', aColor=' + sectionAColor);
+    return true;
+}
+
+initSectionProgram();
 
 // GLSL 着色器源码 - 统一 Gizmo 渲染（圆环面 + 箭头）
 const VS_GIZMO = `
@@ -197,6 +270,8 @@ const meshU_MVP = gl.getUniformLocation(meshProgram, 'uMVP');
 const meshU_Model = gl.getUniformLocation(meshProgram, 'uModel');
 const meshU_Color = gl.getUniformLocation(meshProgram, 'uColor');
 const meshU_Ambient = gl.getUniformLocation(meshProgram, 'uAmbient');
+const meshU_ClipEnabled = gl.getUniformLocation(meshProgram, 'uClipEnabled');
+const meshU_ClipPlane = gl.getUniformLocation(meshProgram, 'uClipPlane');
 const meshAPos = gl.getAttribLocation(meshProgram, 'aPos');
 const meshANormal = gl.getAttribLocation(meshProgram, 'aNormal');
 
@@ -401,6 +476,15 @@ resize();
 let showThreeViews = false;
 let showOutline = false;
 let whiteBackground = false;
+let sectionMode = false;
+// 剖切平面状态
+let sectionPlanePos = [0, 0, 0];  // 剖切平面中心位置（世界坐标）
+let sectionPlaneNormal = [0, 0, 1];  // 剖切平面法向量（默认Z方向）
+let sectionPlaneSize = 1;  // 剖切平面尺寸（自适应）
+let draggingSection = false;
+let dragSectionStartPos = null;
+let dragSectionStartPlanePos = null;
+let sectionPlaneHovered = false;  // 剖切平面悬停状态
 const btnViews = document.getElementById('btnViews');
 const btnOutline = document.getElementById('btnOutline');
 const btnBg = document.getElementById('btnBg');
@@ -428,6 +512,20 @@ btnBg.addEventListener('click', () => {
         gl.clearColor(1.0, 1.0, 1.0, 1.0); // 白色背景
     } else {
         gl.clearColor(0.102, 0.102, 0.18, 1); // 原来的深色背景
+    }
+});
+
+//==================== 9c. 刨面功能 ====================
+const btnSection = document.getElementById('btnSection');
+btnSection.addEventListener('click', () => {
+    sectionMode = !sectionMode;
+    btnSection.classList.toggle('active', sectionMode);
+    if (sectionMode && meshData) {
+        // 初始化剖切平面到零件几何中心
+        sectionPlanePos = [meshPosition.x, meshPosition.y, meshPosition.z];
+        sectionPlaneNormal = [0, 0, 1];
+        // 自适应尺寸
+        sectionPlaneSize = Math.max(meshData.bboxSize.x, meshData.bboxSize.y, meshData.bboxSize.z) * meshData.scale * 1.5;
     }
 });
 
@@ -764,7 +862,21 @@ function checkMeshIntersection(mouseX, mouseY) {
 
 // 鼠标移动事件（悬停检测）
 canvas.addEventListener('mousemove', e => {
-    if (draggingGizmo) return;  // 拖拽手柄时不检测悬停
+    if (draggingGizmo || draggingSection) return;  // 拖拽时不检测悬停
+    
+    // 刨面模式下检测平面悬停
+    if (sectionMode && meshData) {
+        const wasSectionPlaneHovered = sectionPlaneHovered;
+        sectionPlaneHovered = checkSectionPlaneHover(e.clientX, e.clientY);
+        
+        if (sectionPlaneHovered) {
+            if (sectionPlaneHovered !== wasSectionPlaneHovered) {
+                canvas.style.cursor = 'pointer';
+            }
+            return;
+        }
+        sectionPlaneHovered = false;
+    }
     
     const wasHovering = isHovering;
     isHovering = checkMeshIntersection(e.clientX, e.clientY);
@@ -785,6 +897,18 @@ canvas.addEventListener('mousemove', e => {
 // 鼠标点击事件（选中/取消选中）
 canvas.addEventListener('mousedown', e => {
     if (e.button !== 0) return;  // 只处理左键
+    
+    // 优先检测剖切平面
+    if (sectionMode && meshData) {
+        const sectionHit = checkSectionPlaneHover(e.clientX, e.clientY);
+        if (sectionHit) {
+            draggingSection = true;
+            dragSectionStartPos = { x: e.clientX, y: e.clientY };
+            dragSectionStartPlanePos = [...sectionPlanePos];
+            e.preventDefault();
+            return;
+        }
+    }
     
     if (isSelected) {
         // 已选中：优先检测手柄（箭头紧贴零件，必须先检测手柄）
@@ -820,10 +944,80 @@ window.addEventListener('mouseup', e => {
         draggingGizmo = null;
         dragStartPos = null;
     }
+    if (draggingSection) {
+        draggingSection = false;
+        dragSectionStartPos = null;
+        dragSectionStartPlanePos = null;
+    }
 });
 
 // 拖拽手柄时更新旋转/位置
 window.addEventListener('mousemove', e => {
+    // 剖切平面拖拽
+    if (draggingSection && dragSectionStartPos && dragSectionStartPlanePos) {
+        const planeNormal = sectionPlaneNormal;
+        
+        // 计算相机方向
+        const sp = Math.sin(state.phi), cp = Math.cos(state.phi);
+        const eye = [
+            state.centerX + state.radius * sp * Math.cos(state.theta),
+            state.centerY + state.radius * sp * Math.sin(state.theta),
+            state.centerZ + state.radius * cp
+        ];
+        const fwd = [state.centerX - eye[0], state.centerY - eye[1], state.centerZ - eye[2]];
+        const fwdLen = Math.hypot(fwd[0], fwd[1], fwd[2]);
+        fwd[0] /= fwdLen; fwd[1] /= fwdLen; fwd[2] /= fwdLen;
+        
+        // 相机方向与法向量的点积
+        const camDotNormal = fwd[0]*planeNormal[0] + fwd[1]*planeNormal[1] + fwd[2]*planeNormal[2];
+        const absDot = Math.abs(camDotNormal);
+        
+        if (absDot > 0.7) {
+            // 相机方向接近平行于法向量（俯视/仰视）
+            // 使用屏幕Y位移作为法向移动量
+            const dy = e.clientY - dragSectionStartPos.y;
+            const fov = Math.PI / 4;
+            const pxToWorld = 2 * state.radius * Math.tan(fov / 2) / canvas.height;
+            // 屏幕Y向下为正，相机俯视时向下拖拽应使刨面向相机方向移动（即沿法向量反方向）
+            const sign = camDotNormal > 0 ? -1 : 1;
+            const projection = dy * pxToWorld * sign;
+            
+            sectionPlanePos[0] = dragSectionStartPlanePos[0] + projection * planeNormal[0];
+            sectionPlanePos[1] = dragSectionStartPlanePos[1] + projection * planeNormal[1];
+            sectionPlanePos[2] = dragSectionStartPlanePos[2] + projection * planeNormal[2];
+        } else {
+            // 一般情况：使用射线-参考平面相交法
+            const startRay = getRayFromMouse(dragSectionStartPos.x, dragSectionStartPos.y);
+            const currentRay = getRayFromMouse(e.clientX, e.clientY);
+            
+            // 参考平面：通过起始点，法向量为相机方向
+            const refNormal = fwd;
+            
+            function rayPlaneIntersect(origin, dir, point, normal) {
+                const denom = dir[0]*normal[0] + dir[1]*normal[1] + dir[2]*normal[2];
+                if (Math.abs(denom) < 1e-6) return null;
+                const t = ((point[0]-origin[0])*normal[0] + (point[1]-origin[1])*normal[1] + (point[2]-origin[2])*normal[2]) / denom;
+                if (t < 0) return null;
+                return [origin[0]+dir[0]*t, origin[1]+dir[1]*t, origin[2]+dir[2]*t];
+            }
+            
+            const startHit = rayPlaneIntersect(startRay.origin, startRay.dir, dragSectionStartPlanePos, refNormal);
+            const currentHit = rayPlaneIntersect(currentRay.origin, currentRay.dir, dragSectionStartPlanePos, refNormal);
+            
+            if (startHit && currentHit) {
+                const dx = currentHit[0] - startHit[0];
+                const dy = currentHit[1] - startHit[1];
+                const dz = currentHit[2] - startHit[2];
+                const projection = dx*planeNormal[0] + dy*planeNormal[1] + dz*planeNormal[2];
+                
+                sectionPlanePos[0] = dragSectionStartPlanePos[0] + projection * planeNormal[0];
+                sectionPlanePos[1] = dragSectionStartPlanePos[1] + projection * planeNormal[1];
+                sectionPlanePos[2] = dragSectionStartPlanePos[2] + projection * planeNormal[2];
+            }
+        }
+        return;
+    }
+    
     if (!draggingGizmo || !dragStartPos) return;
     
     if (draggingGizmo === 'ringX') {
@@ -1069,6 +1263,59 @@ function rayTriangleIntersect(rayOrigin, rayDir, v0, v1, v2) {
     if (v < 0.0 || u+v > 1.0) return false;
     const t = f*(edge2[0]*q[0]+edge2[1]*q[1]+edge2[2]*q[2]);
     return t > EPSILON;
+}
+
+// 检测鼠标是否在剖切平面上（射线-平面相交）
+function checkSectionPlaneHover(mouseX, mouseY) {
+    if (!sectionMode || !meshData) {
+        console.log('[Plane] skip: sectionMode=' + sectionMode + ' meshData=' + !!meshData);
+        return false;
+    }
+    
+    const ray = getRayFromMouse(mouseX, mouseY);
+    const pos = sectionPlanePos;
+    const normal = sectionPlaneNormal;
+    const size = sectionPlaneSize;
+    
+    // 射线与平面相交
+    const denom = ray.dir[0]*normal[0] + ray.dir[1]*normal[1] + ray.dir[2]*normal[2];
+    if (Math.abs(denom) < 1e-6) return false;
+    
+    const t = ((pos[0]-ray.origin[0])*normal[0] + 
+               (pos[1]-ray.origin[1])*normal[1] + 
+               (pos[2]-ray.origin[2])*normal[2]) / denom;
+    
+    if (t < 0) return false;
+    
+    // 交点
+    const hitX = ray.origin[0] + ray.dir[0]*t;
+    const hitY = ray.origin[1] + ray.dir[1]*t;
+    const hitZ = ray.origin[2] + ray.dir[2]*t;
+    
+    // 计算切向量（与渲染一致）
+    let t1x, t1y, t1z, t2x, t2y, t2z;
+    if (Math.abs(normal[2]) > 0.9) {
+        t1x = 1; t1y = 0; t1z = 0;
+    } else {
+        t1x = normal[1]; t1y = -normal[0]; t1z = 0;
+        const l1 = Math.hypot(t1x, t1y, t1z);
+        t1x /= l1; t1y /= l1; t1z /= l1;
+    }
+    t2x = normal[1]*t1z - normal[2]*t1y;
+    t2y = normal[2]*t1x - normal[0]*t1z;
+    t2z = normal[0]*t1y - normal[1]*t1x;
+    const l2 = Math.hypot(t2x, t2y, t2z);
+    t2x /= l2; t2y /= l2; t2z /= l2;
+    
+    // 检查交点是否在矩形范围内
+    const dx = hitX - pos[0], dy = hitY - pos[1], dz = hitZ - pos[2];
+    const u = dx*t1x + dy*t1y + dz*t1z;
+    const v = dx*t2x + dy*t2y + dz*t2z;
+    const half = size / 2;
+    
+    const inBounds = Math.abs(u) <= half && Math.abs(v) <= half;
+    console.log('[Plane] t=' + t.toFixed(3) + ' size=' + size.toFixed(3) + ' u=' + u.toFixed(3) + ' v=' + v.toFixed(3) + ' half=' + half.toFixed(3) + ' inBounds=' + inBounds);
+    return inBounds;
 }
 
 // 检测是否点击了变换手柄
@@ -2175,6 +2422,20 @@ function animate() {
         gl.uniform3f(meshU_Color, cr, cg, cb);
         gl.uniform1f(meshU_Ambient, whiteBackground ? 0.6 : 0.3);
         
+        // 设置剖切平面
+        if (sectionMode) {
+            gl.uniform1i(meshU_ClipEnabled, 1);
+            // 剖切平面方程: normal·(p - pos) = 0 => normal·p - normal·pos = 0
+            // 裁剪条件: normal·p - normal·pos > 0 时 discard
+            // 所以 clipPlane = (normal, -normal·pos)
+            const d = -(sectionPlaneNormal[0]*sectionPlanePos[0] + 
+                       sectionPlaneNormal[1]*sectionPlanePos[1] + 
+                       sectionPlaneNormal[2]*sectionPlanePos[2]);
+            gl.uniform4f(meshU_ClipPlane, sectionPlaneNormal[0], sectionPlaneNormal[1], sectionPlaneNormal[2], d);
+        } else {
+            gl.uniform1i(meshU_ClipEnabled, 0);
+        }
+        
         gl.bindBuffer(gl.ARRAY_BUFFER, meshData.vbo);
         gl.enableVertexAttribArray(meshAPos);
         gl.vertexAttribPointer(meshAPos, 3, gl.FLOAT, false, 24, 0);
@@ -2231,8 +2492,89 @@ function animate() {
         renderGizmo();
     }
     
+    // 渲染剖切平面
+    if (sectionMode && meshData) {
+        renderSectionPlane();
+    }
+    
     // 渲染三视图
     renderThreeViews();
+}
+
+// 剖切平面预分配 VBO
+const sectionPlaneVerts = new Float32Array(42);  // 6个顶点 × 7 floats
+const sectionPlaneVbo = gl.createBuffer();
+
+// 渲染剖切平面（仅矩形，无箭头）
+function renderSectionPlane() {
+    const size = sectionPlaneSize;
+    if (size < 0.001) return;
+    
+    const pos = sectionPlanePos;
+    const normal = sectionPlaneNormal;
+    
+    // 计算切向量
+    let t1x, t1y, t1z, t2x, t2y, t2z;
+    if (Math.abs(normal[2]) > 0.9) {
+        t1x = 1; t1y = 0; t1z = 0;
+    } else {
+        t1x = normal[1]; t1y = -normal[0]; t1z = 0;
+        const l1 = Math.hypot(t1x, t1y, t1z);
+        t1x /= l1; t1y /= l1; t1z /= l1;
+    }
+    t2x = normal[1]*t1z - normal[2]*t1y;
+    t2y = normal[2]*t1x - normal[0]*t1z;
+    t2z = normal[0]*t1y - normal[1]*t1x;
+    const l2 = Math.hypot(t2x, t2y, t2z);
+    t2x /= l2; t2y /= l2; t2z /= l2;
+    
+    const h = size / 2;
+    const ax = pos[0] - t1x*h - t2x*h, ay = pos[1] - t1y*h - t2y*h, az = pos[2] - t1z*h - t2z*h;
+    const bx = pos[0] + t1x*h - t2x*h, by = pos[1] + t1y*h - t2y*h, bz = pos[2] + t1z*h - t2z*h;
+    const cx = pos[0] + t1x*h + t2x*h, cy = pos[1] + t1y*h + t2y*h, cz = pos[2] + t1z*h + t2z*h;
+    const dx = pos[0] - t1x*h + t2x*h, dy = pos[1] - t1y*h + t2y*h, dz = pos[2] - t1z*h + t2z*h;
+    
+    // 悬停高亮颜色 vs 普通颜色
+    const cr = sectionPlaneHovered ? 0.5 : 0.3;
+    const cg = sectionPlaneHovered ? 0.85 : 0.7;
+    const cb = sectionPlaneHovered ? 1.0 : 1.0;
+    const ca = sectionPlaneHovered ? 0.6 : 0.4;
+    
+    // 矩形顶点数据
+    const v = sectionPlaneVerts;
+    let i = 0;
+    v[i++]=ax; v[i++]=ay; v[i++]=az; v[i++]=cr; v[i++]=cg; v[i++]=cb; v[i++]=ca;
+    v[i++]=bx; v[i++]=by; v[i++]=bz; v[i++]=cr; v[i++]=cg; v[i++]=cb; v[i++]=ca;
+    v[i++]=cx; v[i++]=cy; v[i++]=cz; v[i++]=cr; v[i++]=cg; v[i++]=cb; v[i++]=ca;
+    v[i++]=ax; v[i++]=ay; v[i++]=az; v[i++]=cr; v[i++]=cg; v[i++]=cb; v[i++]=ca;
+    v[i++]=cx; v[i++]=cy; v[i++]=cz; v[i++]=cr; v[i++]=cg; v[i++]=cb; v[i++]=ca;
+    v[i++]=dx; v[i++]=dy; v[i++]=dz; v[i++]=cr; v[i++]=cg; v[i++]=cb; v[i++]=ca;
+    
+    // 禁用深度测试等
+    gl.disable(gl.DEPTH_TEST);
+    gl.depthMask(false);
+    gl.disable(gl.CULL_FACE);
+    gl.disable(gl.STENCIL_TEST);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    
+    // 渲染矩形
+    gl.useProgram(sectionProgram);
+    gl.uniformMatrix4fv(sectionU_MVP, false, mvpMat);
+    gl.bindBuffer(gl.ARRAY_BUFFER, sectionPlaneVbo);
+    gl.bufferData(gl.ARRAY_BUFFER, sectionPlaneVerts, gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(sectionAPos);
+    gl.vertexAttribPointer(sectionAPos, 3, gl.FLOAT, false, 28, 0);
+    gl.enableVertexAttribArray(sectionAColor);
+    gl.vertexAttribPointer(sectionAColor, 4, gl.FLOAT, false, 28, 12);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    gl.disableVertexAttribArray(sectionAPos);
+    gl.disableVertexAttribArray(sectionAColor);
+    
+    // 恢复状态
+    gl.disable(gl.BLEND);
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthMask(true);
 }
 
 //6. STL 文件解析

@@ -63,6 +63,13 @@ canvas:active { cursor: grabbing; }
 #filePanel .btn-color:hover { background: #d35400; }
 #filePanel .btn-color.active { background: #27ae60; }
 #filePanel .btn-color.active:hover { background: #229954; }
+#filePanel .btn-section {
+    display: inline-block; margin-top: 6px; margin-left: 6px; padding: 4px 10px; background: #1abc9c;
+    color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 12px;
+}
+#filePanel .btn-section:hover { background: #16a085; }
+#filePanel .btn-section.active { background: #e67e22; }
+#filePanel .btn-section.active:hover { background: #d35400; }
 
 /* 颜色选择面板 */
 .color-panel {
